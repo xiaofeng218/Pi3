@@ -73,7 +73,6 @@ class _SpyObjectPoseHead(nn.Module):
             "scale": torch.exp(summary),
         }
 
-
 def _build_object_multiview(canonical_imgs: torch.Tensor) -> dict[str, torch.Tensor]:
     return {
         "img": canonical_imgs,
@@ -114,6 +113,7 @@ class Pi3XObjectDualStreamTests(unittest.TestCase):
         model.patch_size = 4
         model.object_query_adapter = object_query_adapter
         model.object_pose_head = object_pose_head
+        object.__setattr__(model, "forward_head", lambda *args, **kwargs: {})
 
         imgs = torch.rand(1, 2, 3, 8, 8)
         canonical_imgs_a = torch.full((1, 8, 3, 8, 8), 0.2)

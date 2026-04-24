@@ -75,6 +75,30 @@ class Pi3XObjectModuleTests(unittest.TestCase):
         self.assertTrue(torch.equal(invalid_out["object_valid"], invalid))
         self.assertTrue(torch.equal(empty_valid_out["object_valid"], valid_but_empty))
 
+    def test_object_query_adapter_keeps_valid_zero_feature_masks(self) -> None:
+        adapter = ObjectQueryAdapter(token_dim=8, patch_size=4)
+        adapter.empty_object_query.data.fill_(3.0)
+        rgb_patch_tokens = torch.zeros(1, 1, 4, 8)
+        grasped_object_mask = torch.zeros(1, 1, 8, 8)
+        grasped_object_mask[0, 0, :4, 4:] = 1.0
+        grasped_object_valid = torch.tensor([[True]], dtype=torch.bool)
+
+        out = adapter(rgb_patch_tokens, grasped_object_mask, grasped_object_valid, image_hw=(8, 8))
+
+        self.assertTrue(torch.equal(out["object_query"][0, 0, 0], torch.zeros(8)))
+        self.assertFalse(torch.equal(out["object_query"][0, 0, 0], adapter.empty_object_query.detach()[0, 0, 0]))
+        self.assertTrue(torch.equal(out["object_query_pos"][0, 0, 0], torch.tensor([0, 1], dtype=torch.long)))
+        self.assertTrue(torch.equal(out["object_valid"], grasped_object_valid))
+
+    def test_object_query_adapter_rejects_mismatched_batch_view_shapes(self) -> None:
+        adapter = ObjectQueryAdapter(token_dim=8, patch_size=4)
+        rgb_patch_tokens = torch.randn(1, 2, 4, 8)
+        grasped_object_mask = torch.zeros(1, 1, 8, 8)
+        grasped_object_valid = torch.tensor([[True, False]], dtype=torch.bool)
+
+        with self.assertRaises(ValueError):
+            adapter(rgb_patch_tokens, grasped_object_mask, grasped_object_valid, image_hw=(8, 8))
+
     def test_object_pose_head_outputs_rot_trans_and_scale(self) -> None:
         head = ObjectPoseHead(in_dim=16, hidden_dim=8)
         object_query_feat = torch.tensor(

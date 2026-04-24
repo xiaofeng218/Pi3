@@ -33,6 +33,25 @@ except ImportError:
     # warnings.warn("xFormers is not available (Attention)")
 
 
+def _prepare_attn_bias(
+    attn_bias: Tensor | None,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    for_sdpa: bool,
+) -> Tensor | None:
+    if attn_bias is None:
+        return None
+
+    mask = attn_bias.to(device=device)
+    if mask.dtype == torch.bool:
+        if for_sdpa:
+            return mask
+        return torch.zeros_like(mask, dtype=dtype).masked_fill(~mask, torch.finfo(dtype).min)
+
+    return mask.to(dtype=dtype)
+
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -59,6 +78,9 @@ class Attention(nn.Module):
         
         q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
         attn = q @ k.transpose(-2, -1)
+        attn_bias = _prepare_attn_bias(attn_bias, dtype=attn.dtype, device=attn.device, for_sdpa=False)
+        if attn_bias is not None:
+            attn = attn + attn_bias
 
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
@@ -72,8 +94,6 @@ class Attention(nn.Module):
 class MemEffAttention(Attention):
     def forward(self, x: Tensor, attn_bias=None) -> Tensor:
         if not XFORMERS_AVAILABLE:
-            if attn_bias is not None:
-                raise AssertionError("xFormers is required for using nested tensors")
             return super().forward(x)
 
         B, N, C = x.shape
@@ -82,6 +102,7 @@ class MemEffAttention(Attention):
         # q, k, v = unbind(qkv, 2)
         q, k, v = [qkv[:,:,i] for i in range(3)]
 
+        attn_bias = _prepare_attn_bias(attn_bias, dtype=q.dtype, device=q.device, for_sdpa=False)
         x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
         x = x.reshape([B, N, C])
 
@@ -99,12 +120,13 @@ class FlashAttention(Attention):
         # q, k, v = unbind(qkv, 2)
         q, k, v = [qkv[:,:,i] for i in range(3)]
 
+        attn_bias = _prepare_attn_bias(attn_bias, dtype=q.dtype, device=q.device, for_sdpa=True)
         if q.dtype == torch.bfloat16:
             with nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                x = scaled_dot_product_attention(q, k, v)
+                x = scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
         else:
             with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
-                x = scaled_dot_product_attention(q, k, v)
+                x = scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
 
         x = x.transpose(1, 2).reshape([B, N, C])
 
@@ -309,6 +331,9 @@ class AttentionRope(nn.Module):
         
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)
+        attn_bias = _prepare_attn_bias(attn_bias, dtype=attn.dtype, device=attn.device, for_sdpa=False)
+        if attn_bias is not None:
+            attn = attn + attn_bias
 
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
@@ -322,8 +347,6 @@ class AttentionRope(nn.Module):
 class MemEffAttentionRope(AttentionRope):
     def forward(self, x: Tensor, attn_bias=None, xpos=None) -> Tensor:
         if not XFORMERS_AVAILABLE:
-            if attn_bias is not None:
-                raise AssertionError("xFormers is required for using nested tensors")
             return super().forward(x)
 
         B, N, C = x.shape
@@ -342,6 +365,7 @@ class MemEffAttentionRope(AttentionRope):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
+        attn_bias = _prepare_attn_bias(attn_bias, dtype=q.dtype, device=q.device, for_sdpa=False)
         x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
         x = x.reshape([B, N, C])
 
@@ -367,12 +391,13 @@ class FlashAttentionRope(AttentionRope):
             q = self.rope(q, xpos)
             k = self.rope(k, xpos)
 
+        attn_bias = _prepare_attn_bias(attn_bias, dtype=q.dtype, device=q.device, for_sdpa=True)
         if q.dtype == torch.bfloat16:
             with nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                x = scaled_dot_product_attention(q, k, v)
+                x = scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
         else:
             with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
-                x = scaled_dot_product_attention(q, k, v)
+                x = scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
 
         x = x.transpose(1, 2).reshape([B, N, C])
 

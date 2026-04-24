@@ -35,17 +35,54 @@ class Pi3XDualStreamRoutingTests(unittest.TestCase):
 
         self.assertEqual(tuple(flat.shape), (4, 4))
         self.assertEqual(tuple(owner.shape), (4, 3))
-        self.assertTrue(torch.equal(owner[0], torch.tensor([0, 0, 0])))
-        self.assertTrue(torch.equal(flat[0], hand_queries[0, 0, 0]))
-        self.assertTrue(torch.equal(flat[-1], hand_queries[1, 0, 1]))
+        expected_owner = torch.tensor(
+            [
+                [0, 0, 0],
+                [0, 2, 0],
+                [0, 2, 1],
+                [1, 0, 1],
+            ],
+            dtype=torch.long,
+        )
+        expected_flat = torch.stack(
+            [
+                hand_queries[0, 0, 0],
+                hand_queries[0, 2, 0],
+                hand_queries[0, 2, 1],
+                hand_queries[1, 0, 1],
+            ],
+            dim=0,
+        )
+        self.assertTrue(torch.equal(owner, expected_owner))
+        self.assertTrue(torch.equal(flat, expected_flat))
+
+    def test_flatten_valid_hand_queries_returns_empty_outputs_for_all_invalid_slots(self) -> None:
+        hand_queries = torch.arange(2 * 2 * 2 * 3, dtype=torch.float32).reshape(2, 2, 2, 3)
+        hand_valid = torch.zeros(2, 2, 2, dtype=torch.bool)
+
+        flat, owner = flatten_valid_hand_queries(hand_queries, hand_valid)
+
+        self.assertEqual(tuple(flat.shape), (0, 3))
+        self.assertEqual(tuple(owner.shape), (0, 3))
+        self.assertEqual(flat.dtype, hand_queries.dtype)
+        self.assertEqual(owner.dtype, torch.long)
 
     def test_flatten_object_global_memory_skips_register_tokens(self) -> None:
-        object_tokens = torch.randn(1, 8, 261, 16)
+        object_tokens = torch.arange(1 * 3 * 7 * 2, dtype=torch.float32).reshape(1, 3, 7, 2)
 
         memory = flatten_object_global_memory(object_tokens, patch_start_idx=5)
 
-        self.assertEqual(tuple(memory.shape), (1, 8 * 256, 16))
-        self.assertTrue(torch.equal(memory[:, :256], object_tokens[:, 0, 5:, :]))
+        expected_memory = torch.cat(
+            [
+                object_tokens[:, 0, 5:, :],
+                object_tokens[:, 1, 5:, :],
+                object_tokens[:, 2, 5:, :],
+            ],
+            dim=1,
+        )
+
+        self.assertEqual(tuple(memory.shape), (1, 3 * 2, 2))
+        self.assertTrue(torch.equal(memory, expected_memory))
 
 
 if __name__ == "__main__":

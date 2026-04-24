@@ -335,19 +335,59 @@ If canonical-view interaction later proves ambiguous or unstable, explicit view 
 
 ## 12. Output Head Design
 
-Add a dedicated `ObjectPoseHead` that consumes the final scene-side object query token from each scene view.
+Add a dedicated `ObjectPoseHead` that consumes the scene-side object query token from each scene view.
 
-Input:
+### 12.1 Head input
+
+To stay aligned with the current Pi3X head convention, `ObjectPoseHead` will consume the concatenation of:
+
+- the object-query feature from the penultimate decoder layer
+- the object-query feature from the final decoder layer
+
+Input tensor:
 
 ```python
-object_query_final: Tensor[B, Ns, C_or_2C]
+object_query_feat: Tensor[B, Ns, 2C]
 ```
 
-Recommended output:
+With the current Pi3X hidden size:
+
+```text
+2C = 2048
+```
+
+### 12.2 Head architecture
+
+`ObjectPoseHead` will use one shared trunk followed by three prediction heads.
+
+Shared trunk:
+
+```text
+LayerNorm(2048)
+-> Linear(2048, 1024)
+-> GELU
+-> Linear(1024, 1024)
+-> GELU
+```
+
+Prediction heads:
+
+- rotation head:
+  - `Linear(1024, 6)`
+- translation head:
+  - `Linear(1024, 3)`
+- scale head:
+  - `Linear(1024, 1)`
+
+This keeps the head lightweight while still allowing the three prediction targets to share a common object-aware representation.
+
+### 12.3 Output parameterization
+
+The head outputs:
 
 - `rot6d`: 6
 - `trans`: 3
-- `scale`: 1
+- `log_scale`: 1
 
 Total:
 
@@ -355,12 +395,25 @@ Total:
 10 dims per scene view
 ```
 
-The output is converted into:
+Decoding rules:
 
-- object rotation matrix
-- object translation
-- object scale
-- assembled `obj2cam`
+- `rot6d` is converted to a rotation matrix using the standard 6D rotation representation
+- `trans` is interpreted directly as object translation in camera coordinates
+- `log_scale` is exponentiated:
+  - `scale = exp(log_scale)`
+
+The scale-head bias should be initialized to zero so that the default predicted scale starts near `1.0`.
+
+### 12.4 Explicit exclusions
+
+The first version of `ObjectPoseHead` will not:
+
+- consume scene patch tokens directly
+- consume canonical object tokens directly
+- use object-id embeddings
+- regress a full 4x4 matrix directly
+
+All object-specific evidence must already be compressed into the scene-side object query token by the decoder routing rules.
 
 This head is independent from the scene point/camera/confidence heads, which continue to read only scene patch tokens.
 
@@ -465,4 +518,3 @@ The design is considered correctly implemented when:
 - scene-side object queries aggregate only through `object_global`
 - object pose predictions are produced from scene-side object queries
 - invalid hands and invalid objects are correctly masked from their losses
-

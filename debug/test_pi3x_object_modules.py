@@ -15,16 +15,16 @@ class Pi3XObjectModuleTests(unittest.TestCase):
             [
                 [
                     [
-                        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                        [0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                        [0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                        [0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0],
+                        [9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0],
                     ]
                 ]
             ]
         )
         grasped_object_mask = torch.zeros(1, 1, 8, 8)
-        grasped_object_mask[0, 0, 4:, 4:] = 1.0
+        grasped_object_mask[0, 0, 2:, :6] = 1.0
         grasped_object_valid = torch.tensor([[True]], dtype=torch.bool)
 
         out = adapter(rgb_patch_tokens, grasped_object_mask, grasped_object_valid, image_hw=(8, 8))
@@ -33,12 +33,14 @@ class Pi3XObjectModuleTests(unittest.TestCase):
         self.assertEqual(tuple(out["object_query_pos"].shape), (1, 1, 1, 2))
         self.assertTrue(torch.equal(out["object_valid"], grasped_object_valid))
         self.assertTrue(
-            torch.equal(
+            torch.allclose(
                 out["object_query"][0, 0, 0],
-                torch.tensor([0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0]),
+                torch.tensor([2.0, 1.0, 4.0, 2.0, 0.0, 0.0, 0.0, 0.0]),
+                atol=1e-6,
+                rtol=1e-6,
             )
         )
-        self.assertTrue(torch.equal(out["object_query_pos"][0, 0, 0], torch.tensor([1, 1], dtype=torch.long)))
+        self.assertTrue(torch.equal(out["object_query_pos"][0, 0, 0], torch.tensor([1, 0], dtype=torch.long)))
 
     def test_object_query_adapter_falls_back_consistently_for_invalid_or_empty_masks(self) -> None:
         adapter = ObjectQueryAdapter(token_dim=8, patch_size=4)
@@ -60,9 +62,15 @@ class Pi3XObjectModuleTests(unittest.TestCase):
 
         invalid_out = adapter(rgb_patch_tokens, empty_mask, invalid, image_hw=(8, 8))
         empty_valid_out = adapter(rgb_patch_tokens, empty_mask, valid_but_empty, image_hw=(8, 8))
+        expected_empty_query = adapter.empty_object_query.detach()[0, 0, 0]
+        expected_default_pos = torch.zeros(2, dtype=torch.long)
 
         self.assertEqual(tuple(invalid_out["object_query"].shape), (1, 1, 1, 8))
+        self.assertTrue(torch.equal(invalid_out["object_query"][0, 0, 0], expected_empty_query))
+        self.assertTrue(torch.equal(empty_valid_out["object_query"][0, 0, 0], expected_empty_query))
         self.assertTrue(torch.equal(invalid_out["object_query"], empty_valid_out["object_query"]))
+        self.assertTrue(torch.equal(invalid_out["object_query_pos"][0, 0, 0], expected_default_pos))
+        self.assertTrue(torch.equal(empty_valid_out["object_query_pos"][0, 0, 0], expected_default_pos))
         self.assertTrue(torch.equal(invalid_out["object_query_pos"], empty_valid_out["object_query_pos"]))
         self.assertTrue(torch.equal(invalid_out["object_valid"], invalid))
         self.assertTrue(torch.equal(empty_valid_out["object_valid"], valid_but_empty))
@@ -91,7 +99,7 @@ class Pi3XObjectModuleTests(unittest.TestCase):
         self.assertEqual(tuple(out["log_scale"].shape), (2, 3, 1))
         self.assertEqual(tuple(out["scale"].shape), (2, 3, 1))
         self.assertTrue(torch.all(out["scale"] > 0))
-        self.assertTrue(torch.allclose(out["scale"], torch.exp(out["log_scale"])))
+        self.assertTrue(torch.allclose(out["scale"], torch.exp(out["log_scale"]), atol=1e-6, rtol=1e-6))
 
 
 if __name__ == "__main__":

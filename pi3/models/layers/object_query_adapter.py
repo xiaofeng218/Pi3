@@ -42,6 +42,8 @@ class ObjectQueryAdapter(nn.Module):
             raise ValueError("grasped_object_mask batch/view shape must match rgb_patch_tokens")
         if grasped_object_valid.shape != batch_shape:
             raise ValueError("grasped_object_valid batch/view shape must match rgb_patch_tokens")
+        if rgb_patch_tokens.shape[-1] != self.token_dim:
+            raise ValueError("rgb_patch_tokens last dimension must match token_dim")
 
     def _pool_single(
         self,

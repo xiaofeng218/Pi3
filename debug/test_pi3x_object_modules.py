@@ -99,6 +99,15 @@ class Pi3XObjectModuleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapter(rgb_patch_tokens, grasped_object_mask, grasped_object_valid, image_hw=(8, 8))
 
+    def test_object_query_adapter_rejects_feature_dim_mismatch(self) -> None:
+        adapter = ObjectQueryAdapter(token_dim=8, patch_size=4)
+        rgb_patch_tokens = torch.randn(1, 1, 4, 7)
+        grasped_object_mask = torch.ones(1, 1, 8, 8)
+        grasped_object_valid = torch.tensor([[True]], dtype=torch.bool)
+
+        with self.assertRaises(ValueError):
+            adapter(rgb_patch_tokens, grasped_object_mask, grasped_object_valid, image_hw=(8, 8))
+
     def test_object_pose_head_outputs_rot_trans_and_scale(self) -> None:
         head = ObjectPoseHead(in_dim=16, hidden_dim=8)
         object_query_feat = torch.tensor(

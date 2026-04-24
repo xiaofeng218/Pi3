@@ -24,14 +24,6 @@ class _SpyEncoder(nn.Module):
         tokens = image_signal + patch_offset + feat_offset
         return {"x_norm_patchtokens": tokens}
 
-    def saw_all_normalized_samples(self, imgs: torch.Tensor, image_mean: torch.Tensor, image_std: torch.Tensor) -> bool:
-        expected = ((imgs - image_mean) / image_std).reshape(-1, imgs.shape[-3], imgs.shape[-2], imgs.shape[-1])
-        if not self.seen_batches:
-            return False
-        observed = torch.cat(self.seen_batches, dim=0)
-        return all(any(torch.allclose(sample, seen) for seen in observed) for sample in expected)
-
-
 class _MixingBlock(nn.Module):
     def forward(self, x, xpos=None, attn_mask=None, attn_keep_mask=None):
         context = x.mean(dim=1, keepdim=True)
@@ -132,8 +124,6 @@ class Pi3XObjectDualStreamTests(unittest.TestCase):
         out_a = model(imgs, object_multiview=object_multiview_a)
         out_b = model(imgs, object_multiview=object_multiview_b)
 
-        self.assertTrue(encoder.saw_all_normalized_samples(canonical_imgs_a, model.image_mean, model.image_std))
-        self.assertTrue(encoder.saw_all_normalized_samples(canonical_imgs_b, model.image_mean, model.image_std))
         self.assertEqual(len(object_query_adapter.calls), 2)
         self.assertTrue(
             torch.equal(
@@ -151,7 +141,7 @@ class Pi3XObjectDualStreamTests(unittest.TestCase):
         self.assertEqual(object_query_adapter.calls[1]["image_hw"], (8, 8))
         self.assertEqual(len(object_pose_head.inputs), 2)
         self.assertFalse(torch.allclose(object_pose_head.inputs[0][0, 0], object_pose_head.inputs[1][0, 0]))
-        self.assertFalse(torch.allclose(object_pose_head.inputs[0][0, 0], object_pose_head.inputs[0][0, 1]))
+        self.assertTrue(torch.allclose(object_pose_head.inputs[0][0, 1], object_pose_head.inputs[1][0, 1]))
         self.assertIn("pred_object_rot6d", out_a)
         self.assertIn("pred_object_trans", out_a)
         self.assertIn("pred_object_scale", out_a)

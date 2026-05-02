@@ -17,6 +17,7 @@ class BaseDataset(EasyDataset):
         resolution=None,            # (width, height) or list of (width, height) or list of int
         aug_crop=False,             # False or int, slightly scale the image a bit larger than the target resolution
         aug_focal=False,            # False or float in [0, 1]
+        use_crop=True,
         z_far=0,
         frame_num=2,
         transform=tvf.ToTensor(),
@@ -28,6 +29,7 @@ class BaseDataset(EasyDataset):
         random_sample_thres=0.1,
         shuffle=True,
         use_sparse_depth=False,
+        fix_epoch_seed=False,       # if True, reset RNG to the same seed every epoch (overfitting)
     ):
         super().__init__()
         self.frame_num = frame_num
@@ -38,11 +40,14 @@ class BaseDataset(EasyDataset):
 
         self.use_sparse_depth = use_sparse_depth
 
+        self._base_seed = int(seed)
+        self.fix_epoch_seed = fix_epoch_seed
         self._rng = np.random.default_rng(seed)
         self._set_resolutions(resolution)
 
         self.aug_crop = aug_crop
         self.aug_focal = aug_focal
+        self.use_crop = use_crop
 
         self.z_far = z_far
 
@@ -62,6 +67,12 @@ class BaseDataset(EasyDataset):
         self.max_refetch = max_refetch
 
         self.random_sample_thres = random_sample_thres  # default not to do that
+
+    def set_epoch(self, epoch, base_seed=None):
+        seed = base_seed if base_seed is not None else self._base_seed
+        if not self.fix_epoch_seed:
+            seed = seed + epoch
+        self._rng = np.random.default_rng(seed)
 
     def convert_attributes(self):
         """
@@ -124,11 +135,40 @@ class BaseDataset(EasyDataset):
 
         self.num_resoluions = len(self._resolutions)
 
+    def _resize_to_resolution(self, image, depthmap, intrinsics, resolution, normal=None, far_mask=None):
+        if not isinstance(image, PIL.Image.Image):
+            image = PIL.Image.fromarray(image)
+
+        src_w, src_h = image.size
+        dst_w, dst_h = resolution
+        if (src_w, src_h) != (dst_w, dst_h):
+            image = image.resize((dst_w, dst_h), resample=PIL.Image.BICUBIC)
+            if depthmap is not None:
+                depthmap = cv2.resize(depthmap, (dst_w, dst_h), interpolation=cv2.INTER_NEAREST)
+            if normal is not None:
+                normal = cv2.resize(normal, (dst_w, dst_h), interpolation=cv2.INTER_NEAREST)
+            if far_mask is not None:
+                far_mask = cv2.resize(far_mask, (dst_w, dst_h), interpolation=cv2.INTER_NEAREST)
+
+            intrinsics = intrinsics.copy()
+            sx = float(dst_w) / float(src_w)
+            sy = float(dst_h) / float(src_h)
+            intrinsics[0, 0] *= sx
+            intrinsics[1, 1] *= sy
+            intrinsics[0, 2] *= sx
+            intrinsics[1, 2] *= sy
+
+        other = [x for x in [normal, far_mask] if x is not None]
+        return image, depthmap, intrinsics, *other
+
     def _crop_resize_if_necessary(self, image, depthmap, intrinsics, resolution, rng=None, info=None, normal=None, far_mask=None):
         """ This function:
             - first downsizes the image with LANCZOS inteprolation,
               which is better than bilinear interpolation in
         """
+        if not self.use_crop:
+            return self._resize_to_resolution(image, depthmap, intrinsics, resolution, normal=normal, far_mask=far_mask)
+
         if not isinstance(image, PIL.Image.Image):
             image = PIL.Image.fromarray(image)
 
@@ -303,4 +343,3 @@ class BaseDataset(EasyDataset):
         np.save(save_path, save_dict)
 
         print(f'Saved cache to {save_path}.', flush=True)
-

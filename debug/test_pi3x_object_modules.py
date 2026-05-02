@@ -128,11 +128,16 @@ class Pi3XObjectModuleTests(unittest.TestCase):
         out = head(object_query_feat)
 
         self.assertEqual(tuple(out["rot6d"].shape), (2, 3, 6))
+        self.assertEqual(tuple(out["trans_dir"].shape), (2, 3, 3))
+        self.assertEqual(tuple(out["trans_log_scale"].shape), (2, 3, 1))
+        self.assertEqual(tuple(out["trans_scale"].shape), (2, 3, 1))
         self.assertEqual(tuple(out["trans"].shape), (2, 3, 3))
         self.assertEqual(tuple(out["log_scale"].shape), (2, 3, 1))
         self.assertEqual(tuple(out["scale"].shape), (2, 3, 1))
         self.assertTrue(torch.all(out["scale"] > 0))
         self.assertTrue(torch.allclose(out["scale"], torch.exp(out["log_scale"]), atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.allclose(out["trans_scale"], torch.exp(out["trans_log_scale"]), atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.allclose(out["trans"], out["trans_dir"] * out["trans_scale"], atol=1e-6, rtol=1e-6))
 
 
 if __name__ == "__main__":

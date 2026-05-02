@@ -1,0 +1,61 @@
+# @package _global_
+
+trainer: trainers.pi3x_trainer.Pi3XTrainer
+
+train:
+  image_num_range: [6, 12]
+  max_img_per_gpu: 24
+  num_workers: 16
+  batch_size: 1
+  num_epoch: 100
+  iters_per_epoch: -1
+  print_freq: 40
+  base_seed: 666
+  model_dtype: bf16
+  dynamo_backend: NO
+  dynamic_compile: true
+  gradient_accumulation_steps: 1
+  clip_grad: 1.0
+  clip_loss: 10
+  seed: 42
+  resume: null
+  auto_resume: true
+  start_epoch: 0
+  global_step: 0
+  world_size: 1
+  rank: -1
+  gpu: -1
+  dist_on_itp: false
+  find_unused_parameters: false
+  distributed: false
+  dist_url: env://
+  dist_backend: nccl
+  optimizer:
+    type: AdamW
+    lr: 5e-5
+    weight_decay: 5e-2
+    betas: [0.9, 0.95]
+    verbose: true
+    filter_bias_and_bn: true
+    encoder_lr: 5e-6
+  lr_scheduler:
+    type: OneCycleLR
+    max_lr: ${train.optimizer.lr}
+    pct_start: 0.0
+    anneal_strategy: cos
+    div_factor: 1000.0
+    final_div_factor: 100.0
+    total_steps: -1
+
+vis:
+  enabled: true
+  interval: 1000
+  sample_index: 0
+  output_subdir: rerun
+  item_name: pi3x_train_sample
+
+test:
+  num_workers: 16
+  batch_size: 1
+  print_freq: 10
+  iters_per_test: -1

@@ -1,0 +1,9 @@
+_target_: pi3.models.hamer.load.hamer_encoder
+config_file: ${oc.env:HAMER_CONFIG_FILE,configs/hamer/model_config.yaml}
+checkpoint: ${oc.env:HAMER_ENCODER_CKPT,null}
+pretrained: true
+cache_dir: ${oc.env:HAMER_CACHE_DIR,data/model/hamer/_DATA}
+update_cachedir: true
+strict: false
+map_location: cpu
+eval_mode: true

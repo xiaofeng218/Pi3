@@ -1,0 +1,9 @@
+train_loss:
+  _target_: pi3.models.hand_object_loss.HandObjectLoss
+  root_index: 0
+  geom_weight: 1.0
+
+test_loss:
+  _target_: pi3.models.hand_object_loss.HandObjectLoss
+  root_index: 0
+  geom_weight: 1.0

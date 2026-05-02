@@ -11,12 +11,19 @@
 **/__pycache__/
 
 .vscode
+.codex
+.agents
 ckpts
 
 /checkpoints
+/checkpoint
 /data
 /logs
 /outputs
+/third_party
+/third-party
+/vis_upload
+/debug/out_*
 /utils/debug.py
 /configs/data/full.yaml
 *_check/
@@ -24,3 +31,17 @@ ckpts
 
 resize_demo_imgs.py
 img_dir_to_video.py
+
+/dex-ycb-toolkit/.git
+/dex-ycb-toolkit/.gitmodules
+/dex-ycb-toolkit/bop_toolkit/.git
+/dex-ycb-toolkit/freihand/.git
+/dex-ycb-toolkit/data
+/dex-ycb-toolkit/dexycb
+/dex-ycb-toolkit/freihand/data
+/dex-ycb-toolkit/manopth
+/dex-ycb-toolkit/output
+/dex-ycb-toolkit/results/*.tar.gz
+/dex-ycb-toolkit/results/*.zip
+/dex-ycb-toolkit/results/example_results
+/dex-ycb-toolkit/results/cvpr2021_results

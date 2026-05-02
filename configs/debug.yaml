@@ -1,0 +1,60 @@
+# @package _global_
+
+defaults:
+  - pi3x_hand_object
+  - _self_
+
+name: pi3x_train_smoke_gpu
+
+# Override dataset paths and parameters
+train_dataset:
+  data_root: ${oc.env:DEXYCB_ROOT,data/dataset/dexycb}
+  frame_num: 1
+
+test_dataset:
+  data_root: ${oc.env:DEXYCB_ROOT,data/dataset/dexycb}
+  frame_num: 1
+
+# Override hand encoder paths
+hand_encoder:
+  config_file: ${oc.env:HAMER_CONFIG_FILE,configs/hamer/model_config.yaml}
+  checkpoint: ${oc.env:HAMER_ENCODER_CKPT,null}
+  cache_dir: ${oc.env:HAMER_CACHE_DIR,data/model/hamer/_DATA}
+
+# Override model paths and settings
+model:
+  ckpt: ${oc.env:PI3X_CKPT,null}
+  encoder_pretrained: true
+  hamer_config_file: ${oc.env:HAMER_CONFIG_FILE,configs/hamer/model_config.yaml}
+  hamer_cache_dir: ${oc.env:HAMER_CACHE_DIR,data/model/hamer/_DATA}
+
+# Training parameters for quick debug
+train:
+  num_epoch: 1
+  iters_per_epoch: 1
+  batch_size: 1
+  num_workers: 0
+  print_freq: 1
+  dynamic_compile: false
+  dynamo_backend: NO
+  model_dtype: bf16
+  auto_resume: false
+  resume: null
+
+# Test parameters for quick debug
+test:
+  iters_per_test: 1
+  batch_size: 1
+  num_workers: 0
+
+# Logging and visualization
+log:
+  ckpt_interval: 1
+  max_checkpoints: 1
+
+vis:
+  enabled: true
+  interval: 1
+  sample_index: 0
+  output_subdir: rerun
+  item_name: pi3x_train_sample

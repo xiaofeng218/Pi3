@@ -1,0 +1,59 @@
+# Minimal HaMeR inference config used by Pi3X.
+#
+# Runtime assets are intentionally not committed. Download/extract HaMeR assets
+# under the cache directory selected by HAMER_CACHE_DIR, or by the standard
+# default: data/model/hamer/_DATA.
+
+MANO:
+  DATA_DIR: data/
+  MODEL_PATH: data/mano
+  GENDER: neutral
+  NUM_HAND_JOINTS: 15
+  MEAN_PARAMS: data/mano_mean_params.npz
+  CREATE_BODY_POSE: false
+
+EXTRA:
+  FOCAL_LENGTH: 5000
+  NUM_LOG_IMAGES: 4
+  NUM_LOG_SAMPLES_PER_IMAGE: 8
+  PELVIS_IND: 0
+
+DATASETS:
+  BETAS_REG: true
+  CONFIG:
+    SCALE_FACTOR: 0.3
+    ROT_FACTOR: 30
+    TRANS_FACTOR: 0.02
+    COLOR_SCALE: 0.2
+    ROT_AUG_RATE: 0.6
+    TRANS_AUG_RATE: 0.5
+    DO_FLIP: false
+    FLIP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_RATE: 0.0
+    EXTREME_CROP_AUG_LEVEL: 1
+
+MODEL:
+  IMAGE_SIZE: 256
+  IMAGE_MEAN:
+    - 0.485
+    - 0.456
+    - 0.406
+  IMAGE_STD:
+    - 0.229
+    - 0.224
+    - 0.225
+  BACKBONE:
+    TYPE: vit
+    PRETRAINED_WEIGHTS: hamer_training_data/vitpose_backbone.pth
+  MANO_HEAD:
+    TYPE: transformer_decoder
+    IN_CHANNELS: 2048
+    TRANSFORMER_DECODER:
+      depth: 6
+      heads: 8
+      mlp_dim: 1024
+      dim_head: 64
+      dropout: 0.0
+      emb_dropout: 0.0
+      norm: layer
+      context_dim: 1280

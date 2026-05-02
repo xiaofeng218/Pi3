@@ -1,4 +1,5 @@
 from .base.transforms import *
+from .dexycb_dataset import DexYCBDataset
 
 from utils.misc import get_world_size, get_rank
 from torch.utils.data import DataLoader
@@ -8,10 +9,13 @@ from datasets.base.batched_sampler import DynamicBatchSampler, DynamicDistribute
 
 __HIGH_QUALITY_DATASETS__ = ['BlinkVision', 'Game', 'GameNew', 'DynamicStereo', 'FlyingThings3D', 'GTA-sfm', 'Hypersim', 'MatrixCity', 'MidAir', 'Monkaa', 'PointOdyssey', 'Sintel', 'Spring', 'TarTanAir', 'Unreal4k', 'VirtualKitti', 'Habitat']
 __MIDDLE_QUALITY_DATASETS__ = ['BlendedMVG', 'BlendedMVS', 'DTU', 'ETH3D', 'ScanNet', 'Scannetpp', 'Taskonomy']
+__METRIC_DATASETS__ = []
+__TEACH_DATASETS__ = []
 __INDOOR_DATASETS__ = ['Hypersim', 'ScanNet', 'Scannetpp', 'Taskonomy', 'ARKitScenes', 'Habitat']
 
 def create_dataloader(cfg, mode):
     data_loader = DataLoader
+    num_resolution = 1
 
     # pytorch dataset
     if mode == 'train':
@@ -77,11 +81,22 @@ def create_dataloader(cfg, mode):
     max_img_per_gpu = cfg.train.max_img_per_gpu if 'max_img_per_gpu' in cfg.train else image_num_range[0]
     print(f'Max frame number per rank {max_img_per_gpu}')
     if mode == 'train' and cfg.train.iters_per_epoch > 0:
-        print('Needed batch number per epoch (per rank):', (max_img_per_gpu // image_num_range[0]) * cfg.train.iters_per_epoch)
-        print('Dataset length per rank:', len(dataset) // world_size)
-        assert (max_img_per_gpu // image_num_range[0]) * cfg.train.iters_per_epoch < len(dataset) // world_size
+        needed = (max_img_per_gpu // image_num_range[0]) * cfg.train.iters_per_epoch
+        available = len(dataset) // world_size
+        print('Needed batch number per epoch (per rank):', needed)
+        print('Dataset length per rank:', available)
+        if needed >= available:
+            print(f'[WARNING] Dataset is smaller than needed batches per epoch ({available} < {needed}). '
+                  f'Data will be repeated within the epoch.')
 
-    sampler = DynamicDistributedSampler(dataset, seed=cfg.train.base_seed, shuffle=cfg_dataloader.shuffle, rank=rank, drop_last=cfg_dataloader.drop_last)
+    sampler = DynamicDistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        seed=cfg.train.base_seed,
+        shuffle=cfg_dataloader.shuffle,
+        drop_last=cfg_dataloader.drop_last,
+    )
     batch_sampler = DynamicBatchSampler(
         sampler, 
         num_resolution, 
@@ -91,12 +106,16 @@ def create_dataloader(cfg, mode):
         rank=rank
     )
 
-    return data_loader(
+    dataloader_kwargs = dict(
         dataset=dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
-        collate_fn=unified_collate_fn
+        collate_fn=unified_collate_fn,
     )
+    if num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["prefetch_factor"] = 2
+    else:
+        dataloader_kwargs["persistent_workers"] = False
+    return data_loader(**dataloader_kwargs)

@@ -1,0 +1,21 @@
+# @package _global_
+
+defaults:
+  - model: pi3x_hand_object
+  - train: train_pi3x_hand_object
+  - loss: hand_object_loss
+  - data: dexycb_hand_object.yaml
+  - hand_encoder: pi3x_hamer_encoder
+  - general: default.yaml
+  - extras: default.yaml
+  - override hydra/job_logging: custom
+  - override hydra/hydra_logging: colorlog
+  - _self_
+
+log:
+  output_dir: ${oc.env:PI3X_OUTPUT_DIR,outputs/${name}}
+  ckpt_dir: ${oc.env:PI3X_CKPT_DIR,outputs/${name}/ckpts}
+
+hydra:
+  run:
+    dir: ${oc.env:PI3X_RUN_DIR,outputs/${name}}

@@ -1,3 +1,31 @@
+import torch
+import torch.nn as nn
+from copy import deepcopy
+from functools import partial
+
+from safetensors.torch import load_file
+from torch.utils.checkpoint import checkpoint
+
+from ...utils.geometry import get_pixel, se3_inverse
+from ..dinov2.layers import Mlp, PatchEmbed
+from ..layers.attention import FlashAttentionRope
+from ..layers.block import BlockRope, PoseInjectBlock
+from ..layers.camera_head import ResConvBlock
+from ..layers.conv_head import ConvHead
+from ..layers.pos_embed import PositionGetter, RoPE2D
+from ..layers.transformer_head import ContextOnlyTransformerDecoder, TransformerDecoder
+
+try:
+    from datasets import __TEACH_DATASETS__
+except Exception:
+    __TEACH_DATASETS__ = []
+
+
+def add_randomized_smooth_pose_noise_torch(poses: torch.Tensor) -> torch.Tensor:
+    # Keep the call sites stable even when the original augmentation helper is absent.
+    return poses
+
+
 class Pi3X(nn.Module):
     def __init__(
             self,
@@ -16,8 +44,8 @@ class Pi3X(nn.Module):
         # ----------------------
         #        Encoder
         # ----------------------
-        from models.moge.model.dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg, dinov2_vits14_reg, dinov2_vitb14_reg
-        self.encoder = dinov2_vitl14_reg(pretrained=False, use_checkpoint=True)             # always use checkpoint
+        from ..dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg, dinov2_vits14_reg, dinov2_vitb14_reg
+        self.encoder = dinov2_vitl14_reg(pretrained=False)
         self.patch_size = 14
         del self.encoder.mask_token
 

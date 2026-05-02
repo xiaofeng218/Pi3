@@ -15,7 +15,8 @@ import warnings
 import torch
 from torch import nn, Tensor
 
-from .attention import Attention, MemEffAttention, CrossAttentionRope, MemEffCrossAttentionRope, FlashAttentionRope
+from .attention import Attention, MemEffAttention, CrossAttentionRope, MemEffCrossAttentionRope, FlashAttentionRope, FlashCrossAttentionRope, PRopeFlashAttention
+from .lora import LoRALinear
 from ..dinov2.layers.drop_path import DropPath
 from ..dinov2.layers.layer_scale import LayerScale
 from ..dinov2.layers.mlp import Mlp
@@ -347,7 +348,7 @@ class CrossBlockRope(nn.Module):
         act_layer: Callable[..., nn.Module] = nn.GELU,
         norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
         attn_class: Callable[..., nn.Module] = Attention,
-        cross_attn_class: Callable[..., nn.Module] = CrossAttentionRope,
+        cross_attn_class: Callable[..., nn.Module] = FlashCrossAttentionRope,
         ffn_layer: Callable[..., nn.Module] = Mlp,
         init_values=None,
         qk_norm: bool=False,
@@ -403,4 +404,278 @@ class CrossBlockRope(nn.Module):
         x = x + cross_attn_residual_func(x, y_)
         x = x + ffn_residual_func(x)
 
+        return x
+
+
+class HOBlockRope(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = False,
+        proj_bias: bool = True,
+        ffn_bias: bool = True,
+        act_layer: Callable[..., nn.Module] = nn.GELU,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        attn_class: Callable[..., nn.Module] = Attention,
+        cross_attn_class: Callable[..., nn.Module] = FlashCrossAttentionRope,
+        ffn_layer: Callable[..., nn.Module] = Mlp,
+        init_values=None,
+        qk_norm: bool = False,
+        rope=None,
+        lora_cfg: Dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.norm1 = norm_layer(dim)
+        self.attn = attn_class(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            proj_bias=proj_bias,
+            rope=rope,
+            qk_norm=qk_norm,
+        )
+
+        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.ls_y = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        self.norm_y = norm_layer(dim)
+        self.cross_attn = cross_attn_class(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            proj_bias=proj_bias,
+            rope=rope,
+            qk_norm=qk_norm,
+        )
+
+        self.norm3 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = ffn_layer(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            act_layer=act_layer,
+            bias=ffn_bias,
+        )
+        if lora_cfg is not None:
+            self.enable_lora(**lora_cfg)
+
+    def enable_lora(
+        self,
+        rank: int = 4,
+        alpha: float = 8.0,
+        targets: List[str] | Tuple[str, ...] | None = None,
+    ) -> None:
+        targets = set(targets or ("cross_attn",))
+        if "cross_attn" in targets:
+            self.cross_attn.q_proj = LoRALinear.from_linear(self.cross_attn.q_proj, rank=rank, alpha=alpha)
+            self.cross_attn.k_proj = LoRALinear.from_linear(self.cross_attn.k_proj, rank=rank, alpha=alpha)
+            self.cross_attn.v_proj = LoRALinear.from_linear(self.cross_attn.v_proj, rank=rank, alpha=alpha)
+            self.cross_attn.proj = LoRALinear.from_linear(self.cross_attn.proj, rank=rank, alpha=alpha)
+        if "self_attn" in targets and hasattr(self.attn, "qkv"):
+            self.attn.qkv = LoRALinear.from_linear(self.attn.qkv, rank=rank, alpha=alpha)
+            self.attn.proj = LoRALinear.from_linear(self.attn.proj, rank=rank, alpha=alpha)
+        if "mlp" in targets and hasattr(self.mlp, "fc1"):
+            self.mlp.fc1 = LoRALinear.from_linear(self.mlp.fc1, rank=rank, alpha=alpha)
+            self.mlp.fc2 = LoRALinear.from_linear(self.mlp.fc2, rank=rank, alpha=alpha)
+
+        for name, param in self.attn.named_parameters():
+            if "q_norm" in name or "k_norm" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+        if "self_attn" not in targets:
+            for param in self.mlp.parameters():
+                param.requires_grad = False
+        else:
+            for name, param in self.attn.named_parameters():
+                if "qkv" in name or "proj" in name:
+                    param.requires_grad = "lora_" in name
+
+    def forward(
+        self,
+        x: Tensor,
+        y: Tensor | None = None,
+        xpos=None,
+        ypos=None,
+        enable_self_attn: bool = True,
+        enable_cross_attn: bool = True,
+    ) -> Tensor:
+        def attn_residual_func(x: Tensor) -> Tensor:
+            return self.ls1(self.attn(self.norm1(x), xpos=xpos))
+
+        def cross_attn_residual_func(x: Tensor, y: Tensor) -> Tensor:
+            return self.ls_y(self.cross_attn(self.norm2(x), y, y, qpos=xpos, kpos=ypos))
+
+        def ffn_residual_func(x: Tensor) -> Tensor:
+            return self.ls2(self.mlp(self.norm3(x)))
+
+        if enable_self_attn:
+            x = x + attn_residual_func(x)
+        if enable_cross_attn and y is not None:
+            y_ = self.norm_y(y)
+            x = x + cross_attn_residual_func(x, y_)
+        x = x + ffn_residual_func(x)
+        return x
+
+
+def _copy_module_state(dst: nn.Module, src: nn.Module) -> None:
+    if type(dst) is not type(src):
+        raise TypeError(f"Cannot copy state from {type(src).__name__} to {type(dst).__name__}")
+    dst.load_state_dict(src.state_dict())
+
+
+def init_ho_block_from_decoder_block(ho_blk: HOBlockRope, blk: nn.Module, cross_scale: float = 1e-3) -> None:
+    """Warm-start an HOBlockRope from a decoder BlockRope.
+
+    The self-attention/MLP path is copied directly. The cross-attention path
+    is initialized from the decoder self-attention qkv/proj weights.
+    """
+    with torch.no_grad():
+        _copy_module_state(ho_blk.norm1, blk.norm1)
+        _copy_module_state(ho_blk.attn, blk.attn)
+        _copy_module_state(ho_blk.norm3, blk.norm2)
+        _copy_module_state(ho_blk.mlp, blk.mlp)
+        _copy_module_state(ho_blk.ls1, blk.ls1)
+        _copy_module_state(ho_blk.ls2, blk.ls2)
+
+        _copy_module_state(ho_blk.norm2, blk.norm1)
+        _copy_module_state(ho_blk.norm_y, blk.norm1)
+
+        qkv_weight = blk.attn.qkv.weight.detach()
+        qkv_bias = blk.attn.qkv.bias.detach() if blk.attn.qkv.bias is not None else None
+        dim = ho_blk.cross_attn.q_proj.weight.shape[0]
+
+        ho_blk.cross_attn.q_proj.weight.copy_(qkv_weight[:dim])
+        ho_blk.cross_attn.k_proj.weight.copy_(qkv_weight[dim:2 * dim])
+        ho_blk.cross_attn.v_proj.weight.copy_(qkv_weight[2 * dim:3 * dim])
+        if qkv_bias is not None:
+            ho_blk.cross_attn.q_proj.bias.copy_(qkv_bias[:dim])
+            ho_blk.cross_attn.k_proj.bias.copy_(qkv_bias[dim:2 * dim])
+            ho_blk.cross_attn.v_proj.bias.copy_(qkv_bias[2 * dim:3 * dim])
+        _copy_module_state(ho_blk.cross_attn.proj, blk.attn.proj)
+        _copy_module_state(ho_blk.cross_attn.q_norm, blk.attn.q_norm)
+        _copy_module_state(ho_blk.cross_attn.k_norm, blk.attn.k_norm)
+        if hasattr(ho_blk.ls_y, "gamma"):
+            ho_blk.ls_y.gamma.fill_(cross_scale)
+
+
+from ...utils.geometry import se3_inverse
+
+
+class PoseInjectBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = False,
+        proj_bias: bool = True,
+        ffn_bias: bool = True,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        init_values=None,
+        drop_path: float = 0.0,
+        act_layer: Callable[..., nn.Module] = nn.GELU,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        attn_class: Callable[..., nn.Module] = PRopeFlashAttention,
+        ffn_layer: Callable[..., nn.Module] = Mlp,
+        qk_norm: bool = False,
+        rope=None,
+    ) -> None:
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = attn_class(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            proj_bias=proj_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+            qk_norm=qk_norm,
+            rope=rope,
+        )
+
+        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = ffn_layer(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            act_layer=act_layer,
+            drop=drop,
+            bias=ffn_bias,
+        )
+        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+    def forward(self, x: Tensor, poses, H, W, patch_h, patch_w, K=None, connect=False, attn_mask=None) -> Tensor:
+        extrinsics = se3_inverse(poses)
+
+        def attn_residual_func(x: Tensor) -> Tensor:
+            return self.ls1(self.attn(self.norm1(x), extrinsics, H, W, patch_h, patch_w, K=K, attn_mask=attn_mask))
+
+        def ffn_residual_func(x: Tensor) -> Tensor:
+            return self.ls2(self.mlp(self.norm2(x)))
+
+        if connect:
+            return x + attn_residual_func(x) + ffn_residual_func(x)
+        return attn_residual_func(x) + ffn_residual_func(x)
+
+
+class CrossOnlyBlockRope(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = False,
+        proj_bias: bool = True,
+        ffn_bias: bool = True,
+        act_layer: Callable[..., nn.Module] = nn.GELU,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        cross_attn_class: Callable[..., nn.Module] = CrossAttentionRope,
+        ffn_layer: Callable[..., nn.Module] = Mlp,
+        init_values=None,
+        qk_norm: bool = False,
+        rope=None,
+    ) -> None:
+        super().__init__()
+        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.ls_y = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        self.norm_y = norm_layer(dim)
+        self.cross_attn = cross_attn_class(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            proj_bias=proj_bias,
+            rope=rope,
+            qk_norm=qk_norm,
+        )
+
+        self.norm3 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = ffn_layer(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            act_layer=act_layer,
+            bias=ffn_bias,
+        )
+
+    def forward(self, x: Tensor, y: Tensor, xpos=None, ypos=None) -> Tensor:
+        def cross_attn_residual_func(x: Tensor, y: Tensor) -> Tensor:
+            return self.ls_y(self.cross_attn(self.norm2(x), y, y, qpos=xpos, kpos=ypos))
+
+        def ffn_residual_func(x: Tensor) -> Tensor:
+            return self.ls2(self.mlp(self.norm3(x)))
+
+        y_ = self.norm_y(y)
+        x = x + cross_attn_residual_func(x, y_)
+        x = x + ffn_residual_func(x)
         return x

@@ -1,0 +1,37 @@
+# @package _global_
+
+train_dataset:
+  _target_: datasets.dexycb_dataset.DexYCBDataset
+  data_root: ${oc.env:DEXYCB_ROOT,data/dataset/dexycb}
+  split_style: s0_like_subject01
+  subject: 20200709-subject-01
+  object_multiview_subdir: canonical_views_224
+  use_crop: false
+  mode: train
+  z_far: 0
+  frame_num: 8
+  resolution:
+    - [224, 224]
+  shuffle: true
+
+train_dataloader:
+  drop_last: true
+  shuffle: true
+
+test_dataset:
+  _target_: datasets.dexycb_dataset.DexYCBDataset
+  data_root: ${oc.env:DEXYCB_ROOT,data/dataset/dexycb}
+  split_style: s0_like_subject01
+  subject: 20200709-subject-01
+  object_multiview_subdir: canonical_views_224
+  use_crop: false
+  mode: test
+  z_far: 0
+  frame_num: 8
+  resolution:
+    - [224, 224]
+  shuffle: false
+
+test_dataloader:
+  drop_last: false
+  shuffle: false

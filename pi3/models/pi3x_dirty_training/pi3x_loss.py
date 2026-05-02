@@ -1,18 +1,49 @@
+import torch.nn as nn
+import math
+from collections import defaultdict
+from typing import *
+
 import torch
 import torch.nn.functional as F
-import torch.nn as nn
-from typing import *
-from collections import defaultdict
-import math
 
-from models.moge.utils3d.torch.utils import depth_edge, normal_edge
-from utils.geometry import homogenize_points, se3_inverse, get_gt_warp, get_pixel, align_sequences_opencv_c2w
-from utils.alignment import align_points_scale
-from dataset.base.transforms import *
-from utils.vis_utils import tensor_to_pil, visualize_depth, write_ply, visualize_normals
-from models.dinov2.models.teacher_mv import compute_normals_robust
+from ...utils.alignment import align_points_scale
+from ...utils.basic import tensor_to_pil, write_ply
+from ...utils.geometry import (
+    depth_edge,
+    get_gt_warp,
+    get_pixel,
+    homogenize_points,
+    se3_inverse,
+)
 
-from dataset import __HIGH_QUALITY_DATASETS__, __MIDDLE_QUALITY_DATASETS__, __METRIC_DATASETS__, __TEACH_DATASETS__
+try:
+    from datasets import __HIGH_QUALITY_DATASETS__, __METRIC_DATASETS__, __MIDDLE_QUALITY_DATASETS__, __TEACH_DATASETS__
+except Exception:
+    __HIGH_QUALITY_DATASETS__ = []
+    __MIDDLE_QUALITY_DATASETS__ = []
+    __METRIC_DATASETS__ = []
+    __TEACH_DATASETS__ = []
+
+try:
+    from datasets.base.transforms import *
+except Exception:
+    pass
+
+
+def normal_edge(normals: torch.Tensor, atol: float = None, rtol: float = None):
+    return torch.zeros(normals.shape[:-1], device=normals.device, dtype=torch.bool)
+
+
+def visualize_depth(*args, **kwargs):
+    return None
+
+
+def visualize_normals(*args, **kwargs):
+    return None
+
+
+def compute_normals_robust(*args, **kwargs):
+    return None
 
 # ---------------------------------------------------------------------------
 # Some functions from MoGe
@@ -449,7 +480,12 @@ class FlowLoss(nn.Module):
 # Final Loss
 # ---------------------------------------------------------------------------
 
-from models.dinov2.models.rav_sym_test9_flow_v2 import PerceptualLoss
+try:
+    from models.dinov2.models.rav_sym_test9_flow_v2 import PerceptualLoss
+except Exception:
+    PerceptualLoss = None
+
+
 class Pi3XLoss(nn.Module):
     def __init__(
         self,
@@ -463,9 +499,15 @@ class Pi3XLoss(nn.Module):
 
         self.use_pred_normalize = use_pred_normalize
 
+        self.teacher = None
+        self.segformer = None
         if use_teacher:
-            self.prepare_teacher()
-            self.prepare_segformer()
+            try:
+                self.prepare_teacher()
+                self.prepare_segformer()
+            except Exception:
+                self.teacher = None
+                self.segformer = None
 
     def _init_frozen_module(self, module):
         """Helper method to initialize and freeze a module's parameters."""
@@ -475,12 +517,14 @@ class Pi3XLoss(nn.Module):
         return module
 
     def prepare_segformer(self):
-        from models.segformer.model import EncoderDecoder
+        from ..segformer.model import EncoderDecoder
         self.segformer = EncoderDecoder()
         self.segformer.load_state_dict(torch.load('ckpts/segformer.b0.512x512.ade.160k.pth', map_location=torch.device('cpu'), weights_only=False)['state_dict'])
         self.segformer = self.segformer.cuda().eval()
 
     def predict_sky_mask(self, imgs, chunk_size=8):
+        if self.segformer is None:
+            return torch.zeros(imgs.shape[0], imgs.shape[-2], imgs.shape[-1], device=imgs.device, dtype=torch.bool)
         # with torch.no_grad():
         #     output = self.segformer.inference_(imgs)
         #     output = output == 2
@@ -497,18 +541,14 @@ class Pi3XLoss(nn.Module):
         return torch.cat(outputs, dim=0)
 
     def prepare_teacher(self):
-        from models.dinov2.models.teacher_mv import TeacherMV
-        # if mode == 'low_res':
-        #     self.teacher = TeacherMV(ckpts='outputs/pi3x_teacher_new_2025-10-24_18-55-54/ckpts/checkpoint_39/pytorch_model.bin').cuda().eval()
-        # else:
-        self.teacher = TeacherMV(ckpts='outputs/pi3x_teacher_new_hres_2025-10-26_15-35-23/ckpts/checkpoint_49/pytorch_model.bin').cuda().eval()
+        raise RuntimeError("TeacherMV is unavailable in this workspace")
 
     def teach(self, gt, ref_idxs=None):
         teach_dataset = __TEACH_DATASETS__
 
         teach_batch_id = [i for i, x in enumerate(gt['dataset_names']) if x in teach_dataset]
 
-        if len(teach_batch_id) == 0:
+        if len(teach_batch_id) == 0 or self.teacher is None:
             return gt
         imgs = gt['imgs'][teach_batch_id]
         B, N, _, H, W = imgs.shape

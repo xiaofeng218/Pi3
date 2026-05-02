@@ -1,0 +1,16 @@
+asset_root: data/model
+models:
+  pi3x:
+    default_path: data/model/pi3x/Pi3X
+    source: huggingface
+    repo_id: yyfz233/Pi3X
+    env: PI3X_CKPT
+  hamer:
+    default_path: data/model/hamer/_DATA
+    source: https
+    url: https://www.cs.utexas.edu/~pavlakos/hamer/data/hamer_demo_data.tar.gz
+    google_drive_id: 1mv7CUAnm73oKsEEG1xE3xH2C_oqcFSzT
+    config_env: HAMER_CONFIG_FILE
+    cache_env: HAMER_CACHE_DIR
+    checkpoint_env: HAMER_ENCODER_CKPT
+    config_file: configs/hamer/model_config.yaml

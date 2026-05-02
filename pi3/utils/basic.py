@@ -83,6 +83,118 @@ def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000):
     return torch.stack(tensor_list, dim=0)
 
 
+def load_multimodal_data(path="data/truck", conditions=None, interval=1, PIXEL_LIMIT=255000, verbose=True, device='cpu'):
+    """
+    Loads images and aligns optional conditions (poses, depths, intrinsics).
+    """
+    sources = []
+
+    if osp.isdir(path):
+        if verbose:
+            print(f"Loading images from directory: {path}")
+        filenames = sorted([x for x in os.listdir(path) if x.lower().endswith((".png", ".jpg", ".jpeg"))])
+        for i in range(0, len(filenames), interval):
+            img_path = osp.join(path, filenames[i])
+            try:
+                sources.append(Image.open(img_path).convert("RGB"))
+            except Exception as e:
+                print(f"Could not load image {filenames[i]}: {e}")
+    elif path.lower().endswith(".mp4"):
+        if verbose:
+            print(f"Loading frames from video: {path}")
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise OSError(f"Cannot open video file: {path}")
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % interval == 0:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                sources.append(Image.fromarray(rgb_frame))
+            frame_idx += 1
+        cap.release()
+    else:
+        raise ValueError(f"Unsupported path. Must be a directory or a .mp4 file: {path}")
+
+    if not sources:
+        print("No images found or loaded.")
+        return {'images': torch.empty(0)}
+
+    if verbose:
+        print(f"Found {len(sources)} images/frames. Processing...")
+
+    first_img = sources[0]
+    W_orig, H_orig = first_img.size
+    scale = math.sqrt(PIXEL_LIMIT / (W_orig * H_orig)) if W_orig * H_orig > 0 else 1
+    W_target, H_target = W_orig * scale, H_orig * scale
+    k, m = round(W_target / 14), round(H_target / 14)
+    while (k * 14) * (m * 14) > PIXEL_LIMIT:
+        if k / m > W_target / H_target:
+            k -= 1
+        else:
+            m -= 1
+    TARGET_W, TARGET_H = max(1, k) * 14, max(1, m) * 14
+    if verbose:
+        print(f"All images will be resized to a uniform size: ({TARGET_W}, {TARGET_H})")
+
+    tensor_list = []
+    to_tensor_transform = transforms.ToTensor()
+
+    for img_pil in sources:
+        try:
+            resized_img = img_pil.resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
+            img_tensor = to_tensor_transform(resized_img)
+            tensor_list.append(img_tensor)
+        except Exception as e:
+            print(f"Error processing an image: {e}")
+
+    if not tensor_list:
+        print("No images were successfully processed.")
+        return {'images': torch.empty(0)}
+
+    images_tensor = torch.stack(tensor_list, dim=0)
+    N_out = images_tensor.shape[0]
+
+    out_poses = None
+    out_depths = None
+    out_intrinsics = None
+
+    if conditions is not None:
+        scale_x = TARGET_W / W_orig
+        scale_y = TARGET_H / H_orig
+
+        if 'poses' in conditions and conditions['poses'] is not None:
+            sliced_poses = conditions['poses'][::interval][:N_out]
+            out_poses = torch.from_numpy(sliced_poses).float()[None].to(device)
+
+        if 'depths' in conditions and conditions['depths'] is not None:
+            sliced_depths = conditions['depths'][::interval][:N_out]
+            resized_depths_list = []
+            for d_map in sliced_depths:
+                d_resized = cv2.resize(d_map, (TARGET_W, TARGET_H), interpolation=cv2.INTER_NEAREST)
+                valid_depth = np.logical_and(d_resized > 0, np.isfinite(d_resized))
+                d_resized[~valid_depth] = 0
+                resized_depths_list.append(torch.from_numpy(d_resized))
+            if resized_depths_list:
+                out_depths = torch.stack(resized_depths_list, dim=0)[None].to(device)
+
+        if 'intrinsics' in conditions and conditions['intrinsics'] is not None:
+            sliced_Ks = conditions['intrinsics'][::interval][:N_out].copy()
+            sliced_Ks[:, 0, 0] *= scale_x
+            sliced_Ks[:, 0, 2] *= scale_x
+            sliced_Ks[:, 1, 1] *= scale_y
+            sliced_Ks[:, 1, 2] *= scale_y
+            out_intrinsics = torch.from_numpy(sliced_Ks).float()[None].to(device)
+
+    return images_tensor[None].to(device), {
+        'poses': out_poses,
+        'depths': out_depths,
+        'intrinsics': out_intrinsics,
+    }
+
+
 def tensor_to_pil(tensor):
     """
     Converts a PyTorch tensor to a PIL image. Automatically moves the channel dimension 

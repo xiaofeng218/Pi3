@@ -1,0 +1,15 @@
+asset_root: data/dataset
+datasets:
+  dexycb:
+    default_path: data/dataset/dexycb
+    env: DEXYCB_ROOT
+    downloader: dex-ycb-toolkit/download_dexycb.sh
+    google_drive_ids:
+      - 1Uo7MLqTbXEa-8s7YQZ3duugJ1nXFEo62
+      - 1FkUxas8sv8UcVGgAzmSZlJw1eI5W5CXq
+      - 14up6qsTpvgEyqOQ5hir-QbjMB_dHfdpA
+      - 1NBA_FPyGWOQF5-X9ueAat5g8lDMz-EmS
+    postprocess:
+      object_canonical_views:
+        command: bash dex-ycb-toolkit/run_obj_render.sh "$DEXYCB_ROOT" canonical_views_224 45 224
+        output_subdir: canonical_views_224

@@ -30,6 +30,16 @@ class _MixingBlock(nn.Module):
         return x + context
 
 
+class _MixingCrossBlock(nn.Module):
+    def forward(self, x, y=None, xpos=None, ypos=None, enable_self_attn=True, enable_cross_attn=True):
+        x_context = x.mean(dim=1, keepdim=True)
+        out = x + x_context if enable_self_attn else x
+        if enable_cross_attn and y is not None:
+            y_context = y.mean(dim=1, keepdim=True)
+            out = out + y_context
+        return out
+
+
 class _SpyObjectQueryAdapter(nn.Module):
     def __init__(self, token_dim: int = 1024) -> None:
         super().__init__()
@@ -66,9 +76,14 @@ class _SpyObjectPoseHead(nn.Module):
     def forward(self, object_query_feat: torch.Tensor) -> dict[str, torch.Tensor]:
         self.inputs.append(object_query_feat.detach().clone())
         summary = object_query_feat.mean(dim=-1, keepdim=True)
+        trans_dir = torch.nn.functional.normalize(summary.expand(-1, -1, 3).clone(), dim=-1)
+        trans_scale = torch.exp(summary)
         return {
             "rot6d": summary.expand(-1, -1, 6).clone(),
-            "trans": summary.expand(-1, -1, 3).clone(),
+            "trans_dir": trans_dir,
+            "trans_log_scale": summary.clone(),
+            "trans_scale": trans_scale,
+            "trans": trans_dir * trans_scale,
             "log_scale": summary.clone(),
             "scale": torch.exp(summary),
         }
@@ -110,6 +125,7 @@ class Pi3XObjectDualStreamTests(unittest.TestCase):
 
         model.encoder = encoder
         model.decoder = nn.ModuleList([_MixingBlock(), _MixingBlock()])
+        model.ho_decoder = nn.ModuleList([_MixingCrossBlock(), _MixingCrossBlock()])
         model.patch_size = 4
         model.object_query_adapter = object_query_adapter
         model.object_pose_head = object_pose_head
@@ -143,12 +159,19 @@ class Pi3XObjectDualStreamTests(unittest.TestCase):
         self.assertFalse(torch.allclose(object_pose_head.inputs[0][0, 0], object_pose_head.inputs[1][0, 0]))
         self.assertTrue(torch.allclose(object_pose_head.inputs[0][0, 1], object_pose_head.inputs[1][0, 1]))
         self.assertIn("pred_object_rot6d", out_a)
+        self.assertIn("pred_object_transl_dir", out_a)
+        self.assertIn("pred_object_transl_log_scale", out_a)
+        self.assertIn("pred_object_transl_scale", out_a)
         self.assertIn("pred_object_trans", out_a)
         self.assertIn("pred_object_scale", out_a)
         self.assertEqual(tuple(out_a["pred_object_rot6d"].shape), (1, 2, 6))
+        self.assertEqual(tuple(out_a["pred_object_transl_dir"].shape), (1, 2, 3))
+        self.assertEqual(tuple(out_a["pred_object_transl_log_scale"].shape), (1, 2, 1))
+        self.assertEqual(tuple(out_a["pred_object_transl_scale"].shape), (1, 2, 1))
         self.assertEqual(tuple(out_a["pred_object_trans"].shape), (1, 2, 3))
         self.assertEqual(tuple(out_a["pred_object_scale"].shape), (1, 2, 1))
         self.assertTrue(torch.isfinite(out_a["pred_object_rot6d"]).all())
+        self.assertTrue(torch.allclose(out_a["pred_object_trans"], out_a["pred_object_transl_dir"] * out_a["pred_object_transl_scale"]))
         self.assertTrue(torch.isfinite(out_a["pred_object_trans"]).all())
         self.assertTrue(torch.isfinite(out_a["pred_object_scale"]).all())
         self.assertFalse(torch.allclose(out_a["pred_object_rot6d"][0, 0], out_b["pred_object_rot6d"][0, 0]))

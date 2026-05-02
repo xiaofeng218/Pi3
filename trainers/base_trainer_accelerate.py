@@ -4,7 +4,6 @@ import itertools
 import os
 import random
 import traceback
-from accelerate import Accelerator
 import hydra
 import torch
 import torch.distributed as dist
@@ -36,20 +35,107 @@ from utils.dist import (
     init_distributed_mode,
     setup_for_distributed,
 )
-from accelerate import DistributedDataParallelKwargs
 from transformers.trainer_pt_utils import get_model_param_count
-from accelerate import (
-    DistributedType,
-)
-from accelerate.utils import (
-    DataLoaderConfiguration,
-    DynamoBackend,
-    GradientAccumulationPlugin,
-    ProjectConfiguration,
-    TorchDynamoPlugin,
-    set_seed,
-)
 import numpy as np
+from torchvision.transforms.functional import to_tensor as pil_to_tensor
+
+try:  # pragma: no cover - exercised in the real training environment
+    from accelerate import Accelerator
+    from accelerate import DistributedDataParallelKwargs
+    from accelerate import DistributedType
+    from accelerate.utils import (
+        DataLoaderConfiguration,
+        DynamoBackend,
+        GradientAccumulationPlugin,
+        ProjectConfiguration,
+        TorchDynamoPlugin,
+        set_seed,
+    )
+except ModuleNotFoundError:  # pragma: no cover - used in the test environment
+    from contextlib import contextmanager
+
+    class _NoOpState:
+        deepspeed_plugin = None
+
+    class Accelerator:  # type: ignore[override]
+        def __init__(self, *args, **kwargs):
+            self.num_processes = 1
+            self.is_main_process = True
+            self.gradient_accumulation_steps = kwargs.get("gradient_accumulation_steps", 1)
+            self.sync_gradients = True
+            self.device = torch.device("cpu")
+            self.state = _NoOpState()
+            self.trackers = []
+
+        def prepare(self, *objects):
+            return objects[0] if len(objects) == 1 else objects
+
+        def wait_for_everyone(self):
+            return None
+
+        def init_trackers(self, *args, **kwargs):
+            return None
+
+        def save_state(self, *args, **kwargs):
+            return None
+
+        def load_state(self, *args, **kwargs):
+            return None
+
+        def backward(self, loss):
+            loss.backward()
+
+        def gather(self, tensor):
+            return tensor
+
+        def clip_grad_norm_(self, parameters, max_norm):
+            return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+
+        def log(self, *args, **kwargs):
+            return None
+
+        @contextmanager
+        def accumulate(self, model):
+            del model
+            yield
+
+        @contextmanager
+        def autocast(self):
+            yield
+
+        def end_training(self):
+            return None
+
+    class DistributedDataParallelKwargs:  # type: ignore[override]
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class DistributedType:  # type: ignore[override]
+        NO = "NO"
+
+    class DataLoaderConfiguration:  # type: ignore[override]
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class DynamoBackend:  # type: ignore[override]
+        NO = "NO"
+
+    class GradientAccumulationPlugin:  # type: ignore[override]
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class ProjectConfiguration:  # type: ignore[override]
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class TorchDynamoPlugin:  # type: ignore[override]
+        def __init__(self, *args, **kwargs):
+            pass
+
+    def set_seed(seed, device_specific=False):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
 class BaseTrainer:
     def __init__(self, cfg):
@@ -83,8 +169,12 @@ class BaseTrainer:
         ## 3. Prepare dataloader
         self.log_info("Making train dataloader...")
         self.train_loader = create_dataloader(cfg, 'train')
-        self.log_info("Making test dataloader...")
-        self.test_loader = create_dataloader(cfg, 'test')
+        if bool(getattr(cfg.test, "use_train_loader", False)):
+            self.log_info("Using train dataloader for validation.")
+            self.test_loader = self.train_loader
+        else:
+            self.log_info("Making test dataloader...")
+            self.test_loader = create_dataloader(cfg, 'test')
         self.accelerator.wait_for_everyone()
 
         ## 5. Prepare optimizer and scheduler (fsdp should after preparing the model using accelerate)
@@ -149,6 +239,18 @@ class BaseTrainer:
 
         if self.accelerator.is_main_process:
             self.accelerator.init_trackers(os.path.basename(self.cfg.log.output_dir))
+        self.tb_writer = None
+        if self.cfg.log.use_tensorboard and self.accelerator.is_main_process:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+            except ModuleNotFoundError:
+                from tensorboardX import SummaryWriter
+            self.tb_writer = SummaryWriter(log_dir=self.cfg.log.output_dir)
+
+        if getattr(self, "_pending_resume_path", None) is not None:
+            self.load_training_state(self._pending_resume_path)
+            self.log_info(f"Loaded training state from {self._pending_resume_path}")
+            self._pending_resume_path = None
 
         # Report the training info
         self.total_batch_size = (
@@ -183,6 +285,7 @@ class BaseTrainer:
         latest_epoch = self.auto_resume()
         self.initial_global_step = self.iters_per_epoch * latest_epoch
         self.first_epoch = latest_epoch
+        self._pending_resume_path = getattr(self, "resume_path", None)
 
         os.makedirs(self.cfg.log.ckpt_dir, exist_ok=True)
 
@@ -194,63 +297,75 @@ class BaseTrainer:
     def before_epoch(self, epoch):
         pass
 
+    def _cleanup_checkpoints(self, keep_paths):
+        ckpt_dir = self.cfg.log.ckpt_dir
+        if not os.path.isdir(ckpt_dir):
+            return
+        keep_set = {os.path.normpath(p) for p in keep_paths if os.path.exists(p)}
+        for entry in os.listdir(ckpt_dir):
+            full = os.path.join(ckpt_dir, entry)
+            if os.path.normpath(full) in keep_set:
+                continue
+            if entry.startswith("checkpoint-"):
+                if os.path.isdir(full):
+                    shutil.rmtree(full)
+                else:
+                    os.remove(full)
+                self.log_info(f"Removed old checkpoint: {entry}")
+
+    def _save_ckpt(self, tag, epoch):
+        save_path = os.path.join(self.cfg.log.ckpt_dir, f"checkpoint-{tag}")
+        self.save_training_state(save_path, epoch)
+        self.log_info(f"Saved checkpoint: checkpoint-{tag} (epoch {epoch}, step {self.global_step})")
+        return save_path
+
     def train(self):
-        # Start Train!
         start_time = time.time()
         self.accelerator.wait_for_everyone()
 
-        # Initialize variable to track the best validation metric
-        best_val_metric = float('inf')  # For metrics like loss; use -float('inf') for accuracy
-        best_model_path = None
-
-        max_checkpoints = self.cfg.log.max_checkpoints  # Maximum number of recent checkpoints to keep
-        saved_checkpoints = []  # List to track saved checkpoint paths
+        best_val_metrics = []  # list of (loss, path), sorted best first
+        latest_path = None
 
         for epoch in range(self.first_epoch, self.cfg.train.num_epoch):
-            torch.cuda.reset_peak_memory_stats()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
 
             self.before_epoch(epoch)
 
             train_stats = self.train_one_epoch(epoch)
 
-            # Perform validation at the end of each epoch
             val_stats = self.validate(epoch)
 
-            current_val_metric = val_stats.get("loss", float('inf'))  # Replace "val_loss" with your metric key
-            if current_val_metric < best_val_metric:
-                best_val_metric = current_val_metric
-                best_model_path = os.path.join(
-                    self.cfg.log.ckpt_dir,
-                    "best_model",
+            current_val_loss = val_stats.get("loss", float('inf'))
+
+            # Epoch-end checkpoint
+            if self.accelerator.is_main_process:
+                epoch_path = self._save_ckpt(f"epoch-{epoch:04d}", epoch)
+                latest_path = epoch_path
+
+                # Track best-3 by val loss
+                best_val_metrics.append((current_val_loss, epoch_path))
+                best_val_metrics.sort(key=lambda x: x[0])
+                if len(best_val_metrics) > 3:
+                    _, old_path = best_val_metrics.pop()
+                    if os.path.exists(old_path) and old_path != latest_path:
+                        if os.path.isdir(old_path):
+                            shutil.rmtree(old_path)
+                        else:
+                            os.remove(old_path)
+
+                # Cleanup: keep best 3 + latest 1
+                keep = [p for _, p in best_val_metrics]
+                if latest_path and latest_path not in keep:
+                    keep.append(latest_path)
+                self._cleanup_checkpoints(keep)
+
+                self.log_info(
+                    f"Epoch {epoch} | val_loss={current_val_loss:.4f} | "
+                    f"best_losses={[f'{l:.4f}' for l, _ in best_val_metrics]}"
                 )
-                self.accelerator.save_state(best_model_path, safe_serialization=False)
-                self.log_info(f"Saved best model at epoch {epoch} with val_metric: {best_val_metric:.4f}")
 
             self.accelerator.wait_for_everyone()
-
-            if (
-                epoch + 1
-            ) % self.cfg.log.ckpt_interval == 0 or epoch + 1 == self.cfg.train.num_epoch:
-                if self.accelerator.sync_gradients:
-                    self.global_step = self.iters_per_epoch * (epoch + 1)
-                    save_path = os.path.join(
-                        self.cfg.log.ckpt_dir,
-                        f"checkpoint_{epoch}",
-                    )
-                    self.accelerator.save_state(save_path, safe_serialization=False)
-                    self.log_info(
-                        f"Saved state for global step {self.global_step}"
-                    )
-
-                    # Manage saved checkpoints
-                    saved_checkpoints.append(save_path)
-                    if self.accelerator.is_main_process and len(saved_checkpoints) > max_checkpoints:
-                        oldest_checkpoint = saved_checkpoints.pop(0)
-                        if os.path.exists(oldest_checkpoint):
-                            shutil.rmtree(oldest_checkpoint)
-                            self.log_info(f"Removed old checkpoint: {oldest_checkpoint}")
-
-                self.accelerator.wait_for_everyone()
 
             log_stats = {
                 **{f"train_{k}": v for k, v in train_stats.items()},
@@ -275,38 +390,65 @@ class BaseTrainer:
 
         self.accelerator.wait_for_everyone()
         self.accelerator.end_training()
+        if getattr(self, "tb_writer", None) is not None:
+            self.tb_writer.close()
 
     def validate(self, epoch):
         self.model.eval()
         metric_logger = MetricLogger(delimiter="  ")
-        header = f"Validation Epoch: [{epoch}]"
 
         val_loss = 0.0
         total_samples = 0
 
         self.log_info(f"Start validation for epoch {epoch}")
+        disable_pbar = not self.accelerator.is_main_process
+        total_iters = self.iters_per_test if self.iters_per_test > 0 else len(self.test_loader)
+        pbar = tqdm(
+            total=total_iters,
+            disable=disable_pbar,
+            desc=f"Val   {epoch:>3d}",
+            unit="batch",
+            dynamic_ncols=True,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+        )
+        test_iter = self.test_loader
+        if len(self.test_loader) < total_iters:
+            test_iter = itertools.cycle(self.test_loader)
         with torch.no_grad():
-            for batch in metric_logger.log_every(
-                self.test_loader, self.cfg.train.print_freq, header
-            ):
+            for batch_idx, batch in enumerate(test_iter):
+                if batch_idx >= self.iters_per_test:
+                    break
                 batch = move_to_device(batch, self.accelerator.device)
 
                 # Forward pass
-                outputs = self.forward_batch(batch, mode='test')
-                outputs = self.calculate_loss(outputs, batch, mode='train')
+                forward_outputs = self.forward_batch(batch, mode='test')
+                outputs = self.calculate_loss(forward_outputs, batch, mode='test')
                 loss = outputs.loss
+
+                self.maybe_export_validation_sample(
+                    epoch=epoch,
+                    batch_idx=batch_idx,
+                    batch=batch,
+                    forward_outputs=forward_outputs,
+                    loss_outputs=outputs,
+                    mode="test",
+                )
 
                 # Gather statistics
                 loss_value = loss.item()
-                val_loss += loss_value * len(batch)
-                total_samples += len(batch)
-
-                # self.log_all(outputs, self.global_step, prefix='val')
+                batch_size = batch[0]["img"].shape[0] if isinstance(batch, list) and batch and isinstance(batch[0], dict) else len(batch)
+                val_loss += loss_value * batch_size
+                total_samples += batch_size
 
                 metric_logger.update(**outputs)
+                pbar.set_postfix({"loss": f"{loss_value:.4f}"})
+                pbar.update(1)
+
+        pbar.close()
 
         # Average the validation loss
-        val_loss /= total_samples
+        if total_samples > 0:
+            val_loss /= total_samples
 
         # Gather the stats from all processes
         metric_logger.synchronize_between_processes()
@@ -321,13 +463,11 @@ class BaseTrainer:
         metric_logger.add_meter(
             "min_lr", SmoothedValue(window_size=1, fmt="{value:.6f}")
         )
-        # metric_logger.add_meter(
-        #     "dataloader", SmoothedValue(window_size=1, fmt="{value:.6f}")
-        # )
-        header = "Epoch: [{}]".format(epoch)
         loss_details_dict = {}
         start_steps = epoch * self.iters_per_epoch
         self.global_step = start_steps
+        summary_interval = int(getattr(self.cfg.log, "summary_interval", 10))
+        summary_interval = max(1, summary_interval)
 
         self.log_info(
             "Start training epoch {}, {} iters per inner epoch. Training dtype {}".format(
@@ -335,9 +475,21 @@ class BaseTrainer:
             )
         )
 
-        for it, batch in enumerate(metric_logger.log_every(
-            self.train_loader, self.cfg.train.print_freq, header
-        )):
+        disable_pbar = not self.accelerator.is_main_process
+        pbar = tqdm(
+            total=self.iters_per_epoch,
+            disable=disable_pbar,
+            desc=f"Epoch {epoch:>3d}",
+            unit="step",
+            dynamic_ncols=True,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+        )
+
+        train_iter = self.train_loader
+        if len(self.train_loader) < self.iters_per_epoch:
+            train_iter = itertools.cycle(self.train_loader)
+
+        for it, batch in enumerate(train_iter):
             if it >= self.iters_per_epoch:
                 break
 
@@ -395,16 +547,31 @@ class BaseTrainer:
                     self.optimizer.zero_grad()
                 self.lr_scheduler.step()
 
-            if self.accelerator.sync_gradients:
+                if self.accelerator.sync_gradients:
                     start_steps += 1
 
                     # Report to tensorboard
                     batch_output.update(loss_details_dict)
                     loss_details_dict = {}
 
-                    if start_steps % 10 == 0 :
+                    def _metric_scalar(value):
+                        if torch.is_tensor(value):
+                            if value.numel() == 1:
+                                return value.detach().item()
+                            return value.detach().float().mean().item()
+                        if np.isscalar(value):
+                            return value
+                        return None
+
+                    metric_batch_output = {
+                        key: scalar
+                        for key, value in batch_output.items()
+                        if (scalar := _metric_scalar(value)) is not None
+                    }
+
+                    if start_steps % summary_interval == 0:
                         self.log_all(batch_output, start_steps, prefix='train')
-                    metric_logger.update(**batch_output)
+                    metric_logger.update(**metric_batch_output)
 
                     min_lr = 10.0
                     max_lr = 0.0
@@ -414,8 +581,7 @@ class BaseTrainer:
 
                     metric_logger.update(lr=max_lr)
                     metric_logger.update(min_lr=min_lr)
-                    self.accelerator.log({"lr": max_lr}, step=start_steps)
-                    self.accelerator.log({"min_lr": min_lr}, step=start_steps)
+                    self.log_scalars({"lr": max_lr, "min_lr": min_lr}, step=start_steps)
 
                     weight_decay_value = None
                     for group in self.optimizer.param_groups:
@@ -423,16 +589,42 @@ class BaseTrainer:
                             weight_decay_value = group["weight_decay"]
                     metric_logger.update(weight_decay=weight_decay_value)
                     metric_logger.update(grad_norm=grad_norm)
-                    self.accelerator.log(
-                        {"weight_decay": weight_decay_value}, step=start_steps
-                    )
-                    self.accelerator.log({"grad_norm": grad_norm}, step=start_steps)
+                    self.log_scalars({"weight_decay": weight_decay_value, "grad_norm": grad_norm}, step=start_steps)
 
                     self.global_step = start_steps
 
-        # # gather the stats from all processes
-        # metric_logger.synchronize_between_processes()
-        # print("Averaged stats:", metric_logger)
+                    pbar.set_postfix(
+                        loss=f"{loss_value:.4f}",
+                        lr=f"{max_lr:.2e}",
+                    )
+                    pbar.update(1)
+
+                    # Step-based checkpoint
+                    ckpt_interval = int(getattr(self.cfg.log, "ckpt_interval", 1000))
+                    if start_steps % ckpt_interval == 0 and self.accelerator.is_main_process:
+                        self._save_ckpt(f"step-{start_steps:07d}", epoch)
+
+                    # Step-based visualization
+                    vis_interval = int(getattr(self.cfg, "vis", {}).get("interval", 1000) if hasattr(self.cfg, "vis") else 1000)
+                    if start_steps % vis_interval == 0 and start_steps > 0:
+                        batch_vis = batch
+                        fwd_vis = forward_output
+                        self.maybe_export_validation_sample(
+                            epoch=epoch,
+                            batch_idx=it,
+                            batch=batch_vis,
+                            forward_outputs=fwd_vis,
+                            loss_outputs=batch_output,
+                            mode="train",
+                            global_step=start_steps,
+                        )
+
+            del forward_output, batch_output, loss
+
+        pbar.close()
+        avg_loss = metric_logger.meters.get("loss")
+        if avg_loss is not None:
+            self.log_info(f"Epoch {epoch:>3d} | loss={avg_loss.global_avg:.4f}")
 
         return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
@@ -450,17 +642,39 @@ class BaseTrainer:
             if np.isscalar(v):
                 log_scaler[prefix+'/'+k] = v
                 continue
-            if Image.isImageType(v):
+            if isinstance(v, Image.Image):
                 log_img[prefix+'/'+k] = v
 
         self.accelerator.log(log_scaler, step)
+        if getattr(self, "tb_writer", None) is not None:
+            for k, v in log_scaler.items():
+                self.tb_writer.add_scalar(k, v, global_step=step)
+        log_img_batches = {}
         for tracker in self.accelerator.trackers:
-            tracker.log_images(log_img, step)
+            if log_img:
+                for k, v in log_img.items():
+                    log_img_batches[k] = pil_to_tensor(v).unsqueeze(0)
+                tracker.log_images(log_img_batches, step)
+        if getattr(self, "tb_writer", None) is not None:
+            for k, v in log_img.items():
+                self.tb_writer.add_image(k, pil_to_tensor(v), global_step=step)
+            self.tb_writer.flush()
+
+    def log_scalars(self, values, step):
+        self.accelerator.log(values, step)
+        if getattr(self, "tb_writer", None) is not None:
+            for k, v in values.items():
+                if isinstance(v, (int, float)):
+                    self.tb_writer.add_scalar(k, v, global_step=step)
+            self.tb_writer.flush()
 
     def forward_batch(self, batch, mode='train'):
         output = self.model(batch)
         assert isinstance(output, EasyDict)
         return output
+
+    def maybe_export_validation_sample(self, **kwargs):
+        return None
 
     def calculate_loss(self, output, batch, mode='train'):
         pass
@@ -574,7 +788,14 @@ class BaseTrainer:
 
         self.accelerator = accelerator
 
+    def save_training_state(self, save_path, epoch):
+        self.accelerator.save_state(save_path, safe_serialization=False)
+
+    def load_training_state(self, load_path):
+        self.accelerator.load_state(load_path)
+
     def auto_resume(self):
+        self.resume_path = None
         if self.cfg.train.resume:
             path = self.cfg.train.resume
         elif os.path.exists(self.cfg.log.ckpt_dir):
@@ -594,10 +815,7 @@ class BaseTrainer:
             start_epoch = 0
         else:
             self.log_info(f"Resuming from checkpoint {path}")
-            self.accelerator.load_state(
-                # os.path.join(self.cfg.log.ckpt_dir, path)
-                path
-            )
+            self.resume_path = path
             # Extract epoch number from checkpoint path
             # Handles both "checkpoint_N" and "best_model" formats
             if "checkpoint_" in path:

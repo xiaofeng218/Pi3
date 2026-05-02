@@ -13,21 +13,22 @@ cd Pi3
 
 ## 2. 创建 conda 环境
 
-推荐环境名仍使用 `pi3`：
+仓库内提供了当前可用环境的导出文件：[conda/pi3-environment.yml](/home/hanxiaofeng/Pi3-training/conda/pi3-environment.yml)。
+
+推荐直接创建：
 
 ```bash
-conda create -n pi3 python=3.10 -y
+conda env create -f conda/pi3-environment.yml
 conda activate pi3
-
-pip install -r requirements.txt
-pip install hydra-core omegaconf yacs accelerate einops timm gdown trimesh scipy matplotlib
 pip install -e dex-ycb-toolkit
 ```
 
-如果服务器 CUDA/驱动和当前环境一致，可优先安装 PyTorch CUDA 12.4 版本：
+如果环境已存在，使用更新命令：
 
 ```bash
-pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+conda env update -n pi3 -f conda/pi3-environment.yml --prune
+conda activate pi3
+pip install -e dex-ycb-toolkit
 ```
 
 `dex-ycb-toolkit/run_obj_render.sh` 需要 EGL/OpenGL，缺库时安装：
@@ -36,6 +37,12 @@ pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorc
 sudo apt-get update
 sudo apt-get install -y libegl1 libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 ```
+
+说明：
+
+- 该环境文件固定了当前机器验证通过的 Python、PyTorch CUDA 12.4 和相关 pip 依赖版本。
+- 文件里已移除本机 `prefix`，可以直接在新服务器使用。
+- `dex-ycb-toolkit` 仍建议在建好环境后执行 `pip install -e dex-ycb-toolkit`，因为它依赖当前仓库代码本身，而不是单独从 PyPI 安装。
 
 ## 3. 标准资产目录
 

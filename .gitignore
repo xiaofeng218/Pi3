@@ -39,7 +39,6 @@ img_dir_to_video.py
 /dex-ycb-toolkit/data
 /dex-ycb-toolkit/dexycb
 /dex-ycb-toolkit/freihand/data
-/dex-ycb-toolkit/manopth
 /dex-ycb-toolkit/output
 /dex-ycb-toolkit/results/*.tar.gz
 /dex-ycb-toolkit/results/*.zip

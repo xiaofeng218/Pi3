@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEST_DIR="${1:-${DEXYCB_ROOT:-data/dataset/dexycb}}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+PI3_DATA_ROOT="${PI3_DATA_ROOT:-$REPO_ROOT/data}"
+DEST_DIR="${1:-${DEXYCB_ROOT:-${DEX_YCB_DIR:-$PI3_DATA_ROOT/dataset/dexycb}}}"
 
 # 检查并安装/更新 gdown
 if ! command -v gdown &> /dev/null

@@ -5,7 +5,6 @@
 """DexYCB sequence loader."""
 
 import torch
-import os
 import yaml
 import numpy as np
 import cv2
@@ -14,6 +13,7 @@ from scipy.spatial.transform import Rotation as Rot
 
 from .layers.ycb_group_layer import YCBGroupLayer
 from .layers.mano_group_layer import MANOGroupLayer
+from .paths import dexycb_root
 from .layers.ycb_layer import dcm2rv, rv2dcm
 
 
@@ -44,8 +44,7 @@ class SequenceLoader():
     self._preload = preload
     self._app = app
 
-    assert 'DEX_YCB_DIR' in os.environ, "environment variable 'DEX_YCB_DIR' is not set"
-    self._dex_ycb_dir = os.environ['DEX_YCB_DIR']
+    self._dex_ycb_dir = dexycb_root()
 
     # Load meta.
     meta_file = self._dex_ycb_dir + '/' + self._name + "/meta.yml"

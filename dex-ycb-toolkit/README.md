@@ -45,11 +45,11 @@ This code is tested with Python 3.7 on Linux.
 
 For good practice for Python package management, it is recommended to use virtual environments (e.g., `virtualenv` or `conda`) to ensure packages from different projects do not interfere with each other.
 
-1. Clone the repo with `--recursive` and cd into it:
+1. Clone the repo and cd into it:
 
     ```Shell
-    git clone --recursive git@github.com:NVlabs/dex-ycb-toolkit.git
-    cd dex-ycb-toolkit
+    git clone https://github.com/xiaofeng218/Pi3.git
+    cd Pi3/dex-ycb-toolkit
     ```
 
 2. Install the dex-ycb-toolkit package and dependencies:
@@ -63,18 +63,23 @@ For good practice for Python package management, it is recommended to use virtua
     pip install -r requirements.txt
     cd ..
 
-    # Install manopth
-    cd manopth
-    pip install -e .
-    cd ..
+    # manopth is vendored in this toolkit; no separate third_party checkout is required.
     ```
 
-3. Download the DexYCB dataset from the [project site](https://dex-ycb.github.io).
+3. Download the DexYCB dataset using the project asset registry:
+
+    ```Shell
+    cd ..
+    export PI3_DATA_ROOT=/data/pi3-assets  # optional; defaults to ./data
+    source asset_registry/env.sh
+    bash asset_registry/dataset/download_datasets.sh
+    cd dex-ycb-toolkit
+    ```
 
 4. Set the environment variable for dataset path:
 
     ```Shell
-    export DEX_YCB_DIR=/path/to/dex-ycb
+    export DEX_YCB_DIR=$DEXYCB_ROOT
     ```
 
     `$DEX_YCB_DIR` should be a folder with the following structure:
@@ -87,14 +92,15 @@ For good practice for Python package management, it is recommended to use virtua
     └── models/
     ```
 
-5. Download MANO models and code (`mano_v1_2.zip`) from the [MANO website](https://mano.is.tue.mpg.de) and place the file under `manopath`. Unzip the file and create symlink:
+5. Download MANO models through the project model registry. DexYCB toolkit
+   uses the same MANO files as the HaMeR/Pi3X training code:
 
     ```Shell
-    cd manopth
-    unzip mano_v1_2.zip
-    cd mano
-    ln -s ../mano_v1_2/models models
-    cd ../..
+    cd ..
+    source asset_registry/env.sh
+    bash asset_registry/model/download_models.sh
+    export MANO_ROOT=$PI3_DATA_ROOT/model/hamer/_DATA/data/mano
+    cd dex-ycb-toolkit
     ```
 
 ## Loading Dataset and Visualizing Samples

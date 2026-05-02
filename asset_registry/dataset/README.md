@@ -1,6 +1,7 @@
 # Dataset Assets
 
-Dataset assets are stored under `data/dataset/`.
+Dataset assets are stored under `$PI3_DATA_ROOT/dataset/`; by default this is
+`data/dataset/`.
 
 | Asset | Default path | Source |
 | --- | --- | --- |

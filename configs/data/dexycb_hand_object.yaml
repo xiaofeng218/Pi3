@@ -2,7 +2,7 @@
 
 train_dataset:
   _target_: datasets.dexycb_dataset.DexYCBDataset
-  data_root: ${oc.env:DEXYCB_ROOT,data/dataset/dexycb}
+  data_root: ${oc.env:DEXYCB_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/dexycb}
   split_style: s0_like_subject01
   subject: 20200709-subject-01
   object_multiview_subdir: canonical_views_224
@@ -20,7 +20,7 @@ train_dataloader:
 
 test_dataset:
   _target_: datasets.dexycb_dataset.DexYCBDataset
-  data_root: ${oc.env:DEXYCB_ROOT,data/dataset/dexycb}
+  data_root: ${oc.env:DEXYCB_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/dexycb}
   split_style: s0_like_subject01
   subject: 20200709-subject-01
   object_multiview_subdir: canonical_views_224

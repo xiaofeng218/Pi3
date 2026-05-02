@@ -1,6 +1,7 @@
 # Model Assets
 
-Model assets are stored under `data/model/`.
+Model assets are stored under `$PI3_DATA_ROOT/model/`; by default this is
+`data/model/`.
 
 | Asset | Default path | Source |
 | --- | --- | --- |

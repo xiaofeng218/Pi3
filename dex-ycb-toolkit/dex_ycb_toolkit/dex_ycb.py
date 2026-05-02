@@ -8,6 +8,8 @@ import os
 import yaml
 import numpy as np
 
+from dex_ycb_toolkit.paths import dexycb_root
+
 _SUBJECTS = [
     '20200709-subject-01',
     '20200813-subject-02',
@@ -107,8 +109,7 @@ class DexYCBDataset():
     self._setup = setup
     self._split = split
 
-    assert 'DEX_YCB_DIR' in os.environ, "environment variable 'DEX_YCB_DIR' is not set"
-    self._data_dir = os.environ['DEX_YCB_DIR']
+    self._data_dir = dexycb_root()
     self._calib_dir = os.path.join(self._data_dir, "calibration")
     self._model_dir = os.path.join(self._data_dir, "models")
 

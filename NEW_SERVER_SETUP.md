@@ -39,7 +39,7 @@ sudo apt-get install -y libegl1 libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 
 ## 3. 标准资产目录
 
-本仓库约定所有外部资产放在：
+本仓库约定所有外部资产放在 `PI3_DATA_ROOT` 下。默认值是仓库根目录的 `data/`：
 
 ```text
 data/
@@ -51,6 +51,14 @@ data/
 ```
 
 这些目录由 `.gitignore` 屏蔽，不提交到 GitHub。
+
+如果希望把数据和权重放到项目外的大磁盘，例如 `/data/pi3-assets`，先设置：
+
+```bash
+export PI3_DATA_ROOT=/data/pi3-assets
+```
+
+然后再加载标准环境变量。
 
 加载标准环境变量：
 
@@ -69,6 +77,13 @@ echo "$HAMER_ENCODER_CKPT"   # data/model/hamer/_DATA/hamer_ckpts/checkpoints/ha
 echo "$DEXYCB_ROOT"          # data/dataset/dexycb
 ```
 
+设置 `PI3_DATA_ROOT=/data/pi3-assets` 后，上述路径会自动变为：
+
+```text
+/data/pi3-assets/model/...
+/data/pi3-assets/dataset/...
+```
+
 ## 4. 下载模型权重
 
 当前训练链路需要：
@@ -80,6 +95,7 @@ echo "$DEXYCB_ROOT"          # data/dataset/dexycb
 
 ```bash
 conda activate pi3
+export PI3_DATA_ROOT=/data/pi3-assets   # 可选；不设置则默认使用 ./data
 source asset_registry/env.sh
 bash asset_registry/model/download_models.sh
 ```
@@ -104,6 +120,7 @@ data/model/hamer/_DATA/data/mano_mean_params.npz
 
 ```bash
 conda activate pi3
+export PI3_DATA_ROOT=/data/pi3-assets   # 可选；需与模型下载时保持一致
 source asset_registry/env.sh
 bash asset_registry/dataset/download_datasets.sh
 ```

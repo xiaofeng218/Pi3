@@ -25,6 +25,7 @@ from tabulate import tabulate
 
 from dex_ycb_toolkit.factory import get_dataset
 from dex_ycb_toolkit.logging import get_logger
+from dex_ycb_toolkit.paths import mano_root
 
 bop_toolkit_root = os.path.join(os.path.dirname(__file__), "..", "bop_toolkit")
 sys.path.append(bop_toolkit_root)
@@ -70,12 +71,12 @@ class GraspEvaluator():
     self._mano_layer_r = ManoLayer(flat_hand_mean=False,
                                    ncomps=45,
                                    side='right',
-                                   mano_root='manopth/mano/models',
+                                   mano_root=mano_root(),
                                    use_pca=True)
     self._mano_layer_l = ManoLayer(flat_hand_mean=False,
                                    ncomps=45,
                                    side='left',
-                                   mano_root='manopth/mano/models',
+                                   mano_root=mano_root(),
                                    use_pca=True)
 
     self._gripper_mesh_file = os.path.join("assets", "panda_gripper.obj")

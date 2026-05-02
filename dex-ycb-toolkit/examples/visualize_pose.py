@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from manopth.manolayer import ManoLayer
 
 from dex_ycb_toolkit.factory import get_dataset
+from dex_ycb_toolkit.paths import mano_root
 
 
 def create_scene(sample, obj_file):
@@ -63,7 +64,7 @@ def create_scene(sample, obj_file):
   mano_layer = ManoLayer(flat_hand_mean=False,
                          ncomps=45,
                          side=sample['mano_side'],
-                         mano_root='manopth/mano/models',
+                         mano_root=mano_root(),
                          use_pca=True)
   faces = mano_layer.th_faces.numpy()
   betas = torch.tensor(sample['mano_betas'], dtype=torch.float32).unsqueeze(0)

@@ -11,7 +11,8 @@ ASSET_REGISTRY_DIR="$(cd -- "$(dirname -- "$ASSET_REGISTRY_SOURCE")" && pwd)"
 REPO_ROOT="$(cd -- "${ASSET_REGISTRY_DIR}/.." && pwd)"
 
 export PI3_REPO_ROOT="${PI3_REPO_ROOT:-$REPO_ROOT}"
-export PI3_ASSET_ROOT="${PI3_ASSET_ROOT:-$PI3_REPO_ROOT/data}"
+export PI3_DATA_ROOT="${PI3_DATA_ROOT:-${PI3_ASSET_ROOT:-$PI3_REPO_ROOT/data}}"
+export PI3_ASSET_ROOT="$PI3_DATA_ROOT"
 export PI3_MODEL_ROOT="${PI3_MODEL_ROOT:-$PI3_ASSET_ROOT/model}"
 export PI3_DATASET_ROOT="${PI3_DATASET_ROOT:-$PI3_ASSET_ROOT/dataset}"
 
@@ -21,6 +22,7 @@ export DEX_YCB_DIR="${DEX_YCB_DIR:-$DEXYCB_ROOT}"
 export HAMER_CONFIG_FILE="${HAMER_CONFIG_FILE:-$PI3_REPO_ROOT/configs/hamer/model_config.yaml}"
 export HAMER_CACHE_DIR="${HAMER_CACHE_DIR:-$PI3_MODEL_ROOT/hamer/_DATA}"
 export HAMER_ENCODER_CKPT="${HAMER_ENCODER_CKPT:-$HAMER_CACHE_DIR/hamer_ckpts/checkpoints/hamer.ckpt}"
+export MANO_ROOT="${MANO_ROOT:-$HAMER_CACHE_DIR/data/mano}"
 
 export PI3X_CKPT="${PI3X_CKPT:-$PI3_MODEL_ROOT/pi3x/Pi3X}"
 export HF_HOME="${HF_HOME:-$PI3_MODEL_ROOT/huggingface}"

@@ -8,14 +8,14 @@ name: pi3x_overfit
 
 # Dataset: only 1 track, 12 frames per sample
 train_dataset:
-  data_root: ${oc.env:DEXYCB_ROOT,data/dataset/dexycb}
+  data_root: ${oc.env:DEXYCB_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/dexycb}
   frame_num: 6
   max_tracks: 1
   fix_epoch_seed: true
 
 # Ignored when test.use_train_loader=true; kept mirrored for readability.
 test_dataset:
-  data_root: ${oc.env:DEXYCB_ROOT,data/dataset/dexycb}
+  data_root: ${oc.env:DEXYCB_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/dexycb}
   mode: train
   frame_num: 6
   max_tracks: 1
@@ -25,14 +25,14 @@ test_dataset:
 hand_encoder:
   config_file: ${oc.env:HAMER_CONFIG_FILE,configs/hamer/model_config.yaml}
   checkpoint: ${oc.env:HAMER_ENCODER_CKPT,null}
-  cache_dir: ${oc.env:HAMER_CACHE_DIR,data/model/hamer/_DATA}
+  cache_dir: ${oc.env:HAMER_CACHE_DIR,${oc.env:PI3_DATA_ROOT,data}/model/hamer/_DATA}
 
 # Model paths
 model:
   ckpt: ${oc.env:PI3X_CKPT,null}
   encoder_pretrained: true
   hamer_config_file: ${oc.env:HAMER_CONFIG_FILE,configs/hamer/model_config.yaml}
-  hamer_cache_dir: ${oc.env:HAMER_CACHE_DIR,data/model/hamer/_DATA}
+  hamer_cache_dir: ${oc.env:HAMER_CACHE_DIR,${oc.env:PI3_DATA_ROOT,data}/model/hamer/_DATA}
 
 # Training parameters for overfitting
 train:

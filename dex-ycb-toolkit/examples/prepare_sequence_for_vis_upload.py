@@ -148,11 +148,28 @@ def _solid_vertex_rgba(vertex_count: int, color: tuple[int, int, int]) -> np.nda
     return np.repeat(rgba[None, :], vertex_count, axis=0)
 
 
+def _mesh3d(rr, vertex_positions: np.ndarray, faces: np.ndarray, vertex_colors: np.ndarray):
+    try:
+        return rr.Mesh3D(
+            vertex_positions=vertex_positions,
+            indices=faces,
+            vertex_colors=vertex_colors,
+        )
+    except TypeError:
+        return rr.Mesh3D(
+            vertex_positions=vertex_positions,
+            triangle_indices=faces,
+        )
+
+
 def _deproject_full_depth_pointcloud(
     loader: SequenceLoader,
     camera_index: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Returns the full valid depth point cloud in the current camera coordinates."""
+    if not hasattr(loader, "_load_frame_rgbd"):
+        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
+
     _, depth = loader._load_frame_rgbd(camera_index, loader._frame)
     depth_m = depth.astype(np.float32) / 1000.0
 
@@ -246,9 +263,10 @@ def export_rerun_sequence_rrd(
             vertex_positions = _transform_vertices(template.vertices, pose)
             rr.log(
                 entity_path,
-                rr.Mesh3D(
+                _mesh3d(
+                    rr,
                     vertex_positions=vertex_positions,
-                    indices=template.faces,
+                    faces=template.faces,
                     vertex_colors=_solid_vertex_rgba(
                         vertex_positions.shape[0],
                         _YCB_COLORS.get(obj_id, (180, 180, 180)),
@@ -270,9 +288,10 @@ def export_rerun_sequence_rrd(
             vertex_positions = np.asarray(vertices, dtype=np.float32)
             rr.log(
                 entity_path,
-                rr.Mesh3D(
+                _mesh3d(
+                    rr,
                     vertex_positions=vertex_positions,
-                    indices=faces,
+                    faces=faces,
                     vertex_colors=_solid_vertex_rgba(vertex_positions.shape[0], _HAND_COLOR),
                 ),
             )

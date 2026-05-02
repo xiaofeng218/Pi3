@@ -1,7 +1,8 @@
-asset_root: data/dataset
+asset_root_env: PI3_DATASET_ROOT
+default_asset_root: data/dataset
 datasets:
   dexycb:
-    default_path: data/dataset/dexycb
+    default_path: ${PI3_DATASET_ROOT}/dexycb
     env: DEXYCB_ROOT
     downloader: dex-ycb-toolkit/download_dexycb.sh
     google_drive_ids:

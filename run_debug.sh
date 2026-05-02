@@ -9,7 +9,8 @@
 #     --sample-index 0
 
 # 测试输入的的depth和pi3预测的depth之间的差距
-DEXYCB_ROOT="${DEXYCB_ROOT:-data/dataset/dexycb}"
+PI3_DATA_ROOT="${PI3_DATA_ROOT:-data}"
+DEXYCB_ROOT="${DEXYCB_ROOT:-$PI3_DATA_ROOT/dataset/dexycb}"
 
 python debug/inspect_pi3x_pred_vs_gt.py\
     --data-root "$DEXYCB_ROOT" \

@@ -4,10 +4,10 @@
 
 """Layer to transform YCB mesh vertices with SE3 transformation."""
 
-import os
 import torch
 
 from torch.nn import Module
+from dex_ycb_toolkit.paths import dexycb_root
 
 from ..obj import OBJ
 
@@ -23,8 +23,7 @@ class YCBLayer(Module):
     """
     super(YCBLayer, self).__init__()
 
-    assert 'DEX_YCB_DIR' in os.environ, "environment variable 'DEX_YCB_DIR' is not set"
-    self._path = os.environ['DEX_YCB_DIR'] + "/models"
+    self._path = dexycb_root() + "/models"
     self._classes = ('__background__', '002_master_chef_can', '003_cracker_box',
                      '004_sugar_box', '005_tomato_soup_can',
                      '006_mustard_bottle', '007_tuna_fish_can',

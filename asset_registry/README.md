@@ -1,8 +1,8 @@
 # Asset Registry
 
 This directory documents and bootstraps external assets for this repository.
-Actual downloaded files are stored under repo-root `data/`, which is ignored by
-git.
+Actual downloaded files are stored under `PI3_DATA_ROOT`, which defaults to
+repo-root `data/` and is ignored by git.
 
 Standard layout:
 
@@ -13,6 +13,14 @@ data/
     hamer/_DATA/
   dataset/
     dexycb/
+```
+
+To store assets outside the repository, set one variable before sourcing the
+environment:
+
+```bash
+export PI3_DATA_ROOT=/data/pi3-assets
+source asset_registry/env.sh
 ```
 
 Load the standard environment before running training or debug scripts:

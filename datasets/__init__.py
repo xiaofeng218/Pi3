@@ -23,11 +23,13 @@ def create_dataloader(cfg, mode):
         cfg_dataloader = cfg.train_dataloader
         batch_size = cfg.train.batch_size
         num_workers = cfg.train.num_workers
+        pin_memory = bool(cfg.train.get("pin_memory", True))
     else:
         cfg_dataset = cfg.test_dataset
         cfg_dataloader = cfg.test_dataloader
         batch_size = cfg.test.batch_size
         num_workers = cfg.test.num_workers
+        pin_memory = bool(cfg.test.get("pin_memory", True))
 
     if isinstance(cfg_dataset, str):
         dataset = eval(cfg_dataset) 
@@ -75,19 +77,27 @@ def create_dataloader(cfg, mode):
     world_size = get_world_size()
     rank = get_rank()
 
-    image_num_range = cfg.train.image_num_range if mode == 'train' else [8, 8]
+    if mode == 'train':
+        image_num_range = cfg.train.image_num_range
+    else:
+        image_num_range = cfg.test.get("image_num_range", [8, 8])
     print(f'Sampling frame number range from {image_num_range}')
     # adapte from vggt
     max_img_per_gpu = cfg.train.max_img_per_gpu if 'max_img_per_gpu' in cfg.train else image_num_range[0]
     print(f'Max frame number per rank {max_img_per_gpu}')
     if mode == 'train' and cfg.train.iters_per_epoch > 0:
-        needed = (max_img_per_gpu // image_num_range[0]) * cfg.train.iters_per_epoch
+        min_samples_per_step = max(1, max_img_per_gpu // image_num_range[1])
+        max_samples_per_step = max(1, max_img_per_gpu // image_num_range[0])
+        min_needed = min_samples_per_step * cfg.train.iters_per_epoch
+        max_needed = max_samples_per_step * cfg.train.iters_per_epoch
         available = len(dataset) // world_size
-        print('Needed batch number per epoch (per rank):', needed)
+        print('Needed sample count per epoch (per rank):', f'[{min_needed}, {max_needed}]')
         print('Dataset length per rank:', available)
-        if needed >= available:
-            print(f'[WARNING] Dataset is smaller than needed batches per epoch ({available} < {needed}). '
-                  f'Data will be repeated within the epoch.')
+        if min_needed >= available:
+            print(
+                f'[WARNING] Dataset is smaller than the minimum required samples per epoch '
+                f'({available} < {min_needed}). Data will be repeated within the epoch.'
+            )
 
     sampler = DynamicDistributedSampler(
         dataset,
@@ -110,12 +120,16 @@ def create_dataloader(cfg, mode):
         dataset=dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         collate_fn=unified_collate_fn,
     )
     if num_workers > 0:
-        dataloader_kwargs["persistent_workers"] = True
-        dataloader_kwargs["prefetch_factor"] = 2
+        persistent_workers = cfg_dataloader.get("persistent_workers", mode == 'train')
+        dataloader_kwargs["persistent_workers"] = bool(persistent_workers)
+        dataloader_kwargs["prefetch_factor"] = int(cfg_dataloader.get("prefetch_factor", 2))
+        multiprocessing_context = cfg_dataloader.get("multiprocessing_context", None)
+        if multiprocessing_context is not None:
+            dataloader_kwargs["multiprocessing_context"] = multiprocessing_context
     else:
         dataloader_kwargs["persistent_workers"] = False
     return data_loader(**dataloader_kwargs)

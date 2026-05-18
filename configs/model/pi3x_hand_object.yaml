@@ -4,8 +4,8 @@ use_multimodal: true
 encoder_pretrained: ${oc.env:PI3X_ENCODER_PRETRAINED,true}
 hamer_config_file: ${oc.env:HAMER_CONFIG_FILE,configs/hamer/model_config.yaml}
 hamer_cache_dir: ${oc.env:HAMER_CACHE_DIR,${oc.env:PI3_DATA_ROOT,data}/model/hamer/_DATA}
-hand_mano_layer: null
+hand_encoder_cfg: ${hand_encoder}
 ho_lora_cfg:
   rank: 4
   alpha: 8
-  targets: ["cross_attn"]
+  targets: ["cross_attn", "self_attn", "mlp"]

@@ -76,7 +76,7 @@ class Pi3XHandModuleTests(unittest.TestCase):
         cfg.MANO.MEAN_PARAMS = str(mean_params)
         return cfg
 
-    def test_hand_token_adapter_returns_empty_outputs_without_hands(self) -> None:
+    def test_hand_token_adapter_returns_single_dummy_dense_slot_without_hands(self) -> None:
         adapter = HandTokenAdapter(token_dim=8, patch_size=4)
         rgb_patch_tokens = torch.randn(2, 3, 4, 8)
         hand_queries = torch.zeros(0, 8)
@@ -93,9 +93,11 @@ class Pi3XHandModuleTests(unittest.TestCase):
             image_hw=(8, 8),
         )
 
-        self.assertIsNone(out["dense_tokens"])
-        self.assertIsNone(out["dense_pos"])
-        self.assertEqual(out["num_hand_tokens"], 0)
+        self.assertEqual(tuple(out["dense_tokens"].shape), (2, 3, 1, 8))
+        self.assertEqual(tuple(out["dense_pos"].shape), (2, 3, 1, 2))
+        self.assertEqual(tuple(out["dense_valid_mask"].shape), (2, 3, 1))
+        self.assertFalse(bool(out["dense_valid_mask"].any()))
+        self.assertEqual(out["num_hand_tokens"], 1)
         self.assertEqual(tuple(out["sparse_tokens"].shape), (0, 8))
 
     def test_hand_token_adapter_builds_single_slot_dense_tokens(self) -> None:
@@ -185,9 +187,18 @@ class Pi3XHandModuleTests(unittest.TestCase):
             out["pred_hand_transl"],
             out["pred_hand_transl_dir"] * out["pred_hand_transl_scale"],
         ))
+        self.assertEqual(tuple(out["pred_hand_mano_betas"].shape), (3, 10))
         self.assertEqual(tuple(out["pred_mano_params"]["global_orient"].shape), (3, 1, 3, 3))
         self.assertEqual(tuple(out["pred_mano_params"]["hand_pose"].shape), (3, 15, 3, 3))
         self.assertEqual(tuple(out["pred_mano_params"]["betas"].shape), (3, 10))
+
+    def test_hand_mano_head_pose_and_shape_heads_start_from_zero_residual(self) -> None:
+        head = HandMANOHead(self._make_cfg(), in_dim=16, hidden_dim=8)
+
+        self.assertTrue(torch.allclose(head.decpose.weight, torch.zeros_like(head.decpose.weight)))
+        self.assertTrue(torch.allclose(head.decpose.bias, torch.zeros_like(head.decpose.bias)))
+        self.assertTrue(torch.allclose(head.decshape.weight, torch.zeros_like(head.decshape.weight)))
+        self.assertTrue(torch.allclose(head.decshape.bias, torch.zeros_like(head.decshape.bias)))
 
     def test_hand_mano_head_emits_geometry_when_mano_layer_is_attached(self) -> None:
         head = HandMANOHead(self._make_cfg(), in_dim=16, hidden_dim=8, mano_layer=_FakeMANO())
@@ -197,8 +208,12 @@ class Pi3XHandModuleTests(unittest.TestCase):
 
         self.assertIn("pred_hand_vertices", out)
         self.assertIn("pred_hand_joints_3d", out)
+        self.assertIn("pred_hand_vertices_local", out)
+        self.assertIn("pred_hand_joints_local", out)
         self.assertEqual(tuple(out["pred_hand_vertices"].shape), (3, 778, 3))
         self.assertEqual(tuple(out["pred_hand_joints_3d"].shape), (3, 21, 3))
+        self.assertEqual(tuple(out["pred_hand_vertices_local"].shape), (3, 778, 3))
+        self.assertEqual(tuple(out["pred_hand_joints_local"].shape), (3, 21, 3))
         self.assertTrue(torch.allclose(
             out["pred_hand_vertices"][:, 0],
             out["pred_hand_joints_3d"][:, 0],
@@ -207,6 +222,25 @@ class Pi3XHandModuleTests(unittest.TestCase):
             out["pred_hand_vertices"][:, 0],
             out["pred_hand_vertices"][:, 1],
         ))
+        self.assertTrue(torch.allclose(
+            out["pred_hand_vertices_local"][:, 0],
+            out["pred_hand_joints_local"][:, 0],
+        ))
+
+    def test_hand_mano_head_local_geometry_ignores_global_translation_and_scale_heads(self) -> None:
+        head = HandMANOHead(self._make_cfg(), in_dim=16, hidden_dim=8, mano_layer=_AsymmetricMANO(sign=1.0))
+        with torch.no_grad():
+            for module in (head.project, head.decpose, head.decshape, head.dectransl_dir, head.dectransl_scale, head.decscale):
+                for param in module.parameters():
+                    param.zero_()
+            head.dectransl_scale.bias.fill_(2.0)
+            head.decscale.bias.fill_(1.0)
+
+        hand_tokens = torch.zeros(1, 16)
+        out = head(hand_tokens, hand_is_right=torch.tensor([True], dtype=torch.bool))
+
+        self.assertTrue(torch.allclose(out["pred_hand_joints_local"][0, 0], torch.tensor([0.001, 0.0, 0.0])))
+        self.assertTrue(torch.allclose(out["pred_hand_vertices_local"][0, 1], torch.tensor([0.002, 0.0, 0.0])))
 
     def test_hand_mano_head_uses_left_mano_layer_when_hand_is_left(self) -> None:
         mano_layers = torch.nn.ModuleDict({
@@ -222,10 +256,10 @@ class Pi3XHandModuleTests(unittest.TestCase):
         hand_tokens = torch.zeros(1, 16)
         out = head(hand_tokens, hand_is_right=torch.tensor([False], dtype=torch.bool))
 
-        self.assertTrue(torch.allclose(out["pred_hand_vertices"][0, 0], torch.tensor([-1.0, 0.0, 0.0])))
-        self.assertTrue(torch.allclose(out["pred_hand_joints_3d"][0, 0], torch.tensor([-1.0, 0.0, 0.0])))
-        self.assertTrue(torch.allclose(out["pred_hand_vertices"][0, 1], torch.tensor([-2.0, 0.0, 0.0])))
-        self.assertTrue(torch.allclose(out["pred_hand_joints_3d"][0, 1], torch.tensor([-2.0, 0.0, 0.0])))
+        self.assertTrue(torch.allclose(out["pred_hand_vertices"][0, 0], torch.tensor([-0.001, 0.0, 0.0])))
+        self.assertTrue(torch.allclose(out["pred_hand_joints_3d"][0, 0], torch.tensor([-0.001, 0.0, 0.0])))
+        self.assertTrue(torch.allclose(out["pred_hand_vertices"][0, 1], torch.tensor([-0.002, 0.0, 0.0])))
+        self.assertTrue(torch.allclose(out["pred_hand_joints_3d"][0, 1], torch.tensor([-0.002, 0.0, 0.0])))
 
 
 if __name__ == "__main__":

@@ -11,6 +11,9 @@ from .geometry import aa_to_rotmat, rot6d_to_rotmat
 from .mano_layer import build_mano_layer_pair
 from .config import resolve_mano_path_template
 
+LOG_SCALE_MIN = -10.0
+LOG_SCALE_MAX = 10.0
+
 
 class HandMANOHead(nn.Module):
     def __init__(self, cfg, in_dim: int = 2048, hidden_dim: int = 1024, mano_layer: nn.Module | None = None):
@@ -33,10 +36,11 @@ class HandMANOHead(nn.Module):
             nn.GELU(),
         )
         self.decpose = nn.Linear(self.hidden_dim, self.npose)
-        self.decshape = nn.Linear(self.hidden_dim, 10)
         self.dectransl_dir = nn.Linear(self.hidden_dim, 3)
         self.dectransl_scale = nn.Linear(self.hidden_dim, 1)
         self.decscale = nn.Linear(self.hidden_dim, 1)
+        nn.init.zeros_(self.decpose.weight)
+        nn.init.zeros_(self.decpose.bias)
         nn.init.zeros_(self.dectransl_scale.bias)
         nn.init.zeros_(self.decscale.bias)
 
@@ -44,9 +48,7 @@ class HandMANOHead(nn.Module):
         mean_params_path = resolve_mano_path_template(cfg.MANO.MEAN_PARAMS, mano_data_dir)
         mean_params = np.load(Path(mean_params_path))
         init_hand_pose = torch.from_numpy(mean_params["pose"].astype(np.float32)).unsqueeze(0)
-        init_betas = torch.from_numpy(mean_params["shape"].astype(np.float32)).unsqueeze(0)
         self.register_buffer("init_hand_pose", init_hand_pose)
-        self.register_buffer("init_betas", init_betas)
 
         self.mano = mano_layer
         if self.mano is None and hasattr(cfg, "MANO"):
@@ -107,32 +109,35 @@ class HandMANOHead(nn.Module):
         self,
         hand_tokens: torch.Tensor,
         hand_is_right: torch.Tensor | None = None,
+        hand_betas: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
         batch_size = hand_tokens.shape[0]
         hidden = self.project(hand_tokens)
 
         pred_hand_pose = self.decpose(hidden) + self.init_hand_pose.expand(batch_size, -1)
-        pred_betas = self.decshape(hidden) + self.init_betas.expand(batch_size, -1)
+        pred_betas = hand_betas if hand_betas is not None else hidden.new_zeros((batch_size, 10))
         pred_transl_dir = F.normalize(self.dectransl_dir(hidden), dim=-1, eps=1e-6)
         pred_transl_log_scale = self.dectransl_scale(hidden)
-        pred_transl_scale = torch.exp(pred_transl_log_scale)
+        pred_transl_scale = torch.exp(pred_transl_log_scale.clamp(min=LOG_SCALE_MIN, max=LOG_SCALE_MAX))
         pred_transl = pred_transl_dir * pred_transl_scale
         pred_log_scale = self.decscale(hidden)
-        pred_scale = torch.exp(pred_log_scale)
+        pred_scale = torch.exp(pred_log_scale.clamp(min=LOG_SCALE_MIN, max=LOG_SCALE_MAX))
 
         joint_conversion_fn = {
             "6d": rot6d_to_rotmat,
             "aa": lambda x: aa_to_rotmat(x.view(-1, 3).contiguous()),
         }[self.joint_rep_type]
-        pred_hand_pose = joint_conversion_fn(pred_hand_pose).view(batch_size, self.cfg.MANO.NUM_HAND_JOINTS + 1, 3, 3)
-
+        pred_hand_pose_rotmat = joint_conversion_fn(pred_hand_pose).view(
+            batch_size, self.cfg.MANO.NUM_HAND_JOINTS + 1, 3, 3
+        )
         pred_mano_params = {
-            "global_orient": pred_hand_pose[:, [0]],
-            "hand_pose": pred_hand_pose[:, 1:],
+            "global_orient": pred_hand_pose_rotmat[:, [0]],
+            "hand_pose": pred_hand_pose_rotmat[:, 1:],
             "betas": pred_betas,
         }
         output = {
             "pred_mano_params": pred_mano_params,
+            "pred_hand_mano_betas": pred_betas,
             "pred_hand_transl_dir": pred_transl_dir,
             "pred_hand_transl_log_scale": pred_transl_log_scale,
             "pred_hand_transl_scale": pred_transl_scale,
@@ -146,6 +151,8 @@ class HandMANOHead(nn.Module):
 
         pred_vertices = torch.zeros((batch_size, 778, 3), device=hand_tokens.device, dtype=pred_scale.dtype)
         pred_joints_3d = torch.zeros((batch_size, 21, 3), device=hand_tokens.device, dtype=pred_scale.dtype)
+        pred_vertices_local = torch.zeros((batch_size, 778, 3), device=hand_tokens.device, dtype=pred_scale.dtype)
+        pred_joints_local = torch.zeros((batch_size, 21, 3), device=hand_tokens.device, dtype=pred_scale.dtype)
         pred_scale = pred_scale.reshape(batch_size, 1)
         if isinstance(self.mano, nn.ModuleDict):
             if hand_is_right is None:
@@ -166,18 +173,29 @@ class HandMANOHead(nn.Module):
             idx = side_mask.nonzero(as_tuple=False).squeeze(-1)
             mano_out = self._call_mano_layer(
                 mano_layer,
-                pred_hand_pose[idx, [0]],
-                pred_hand_pose[idx, 1:],
+                pred_hand_pose_rotmat[idx, [0]],
+                pred_hand_pose_rotmat[idx, 1:],
                 pred_betas[idx].float(),
                 (pred_transl[idx] / pred_scale[idx]).float(), # 这里除scale是因为下面整体乘scale时会将pred_transl再乘上一个scale
             )
+            local_mano_out = self._call_mano_layer(
+                mano_layer,
+                torch.eye(3, device=pred_hand_pose_rotmat.device, dtype=pred_hand_pose_rotmat.dtype).view(1, 1, 3, 3).expand(len(idx), -1, -1, -1),
+                pred_hand_pose_rotmat[idx, 1:],
+                pred_betas[idx].float(),
+                torch.zeros((len(idx), 3), device=pred_hand_pose_rotmat.device, dtype=pred_betas.dtype),
+            )
             pred_joints_3d[idx] = mano_out.joints.reshape(len(idx), -1, 3).to(dtype=pred_scale.dtype) * pred_scale[idx].unsqueeze(1) / 1000.0
             pred_vertices[idx] = mano_out.vertices.reshape(len(idx), -1, 3).to(dtype=pred_scale.dtype) * pred_scale[idx].unsqueeze(1) / 1000.0
+            pred_joints_local[idx] = local_mano_out.joints.reshape(len(idx), -1, 3).to(dtype=pred_scale.dtype) / 1000.0
+            pred_vertices_local[idx] = local_mano_out.vertices.reshape(len(idx), -1, 3).to(dtype=pred_scale.dtype) / 1000.0
 
         output.update(
             {
                 "pred_hand_joints_3d": pred_joints_3d,
                 "pred_hand_vertices": pred_vertices,
+                "pred_hand_joints_local": pred_joints_local,
+                "pred_hand_vertices_local": pred_vertices_local,
             }
         )
         return output

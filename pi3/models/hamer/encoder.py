@@ -21,9 +21,38 @@ class HaMeREncoder(nn.Module):
         self.register_buffer("image_mean", mean, persistent=False)
         self.register_buffer("image_std", std, persistent=False)
 
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = True):
+        remapped: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            new_key = key
+            # ViT backbone: backbone.* → backbone.vit.*
+            if key.startswith("backbone.") and not key.startswith("backbone.vit."):
+                new_key = "backbone.vit." + key[len("backbone."):]
+            # Transformer decoder: mano_head.transformer.* → backbone.transformer.*
+            elif key.startswith("mano_head.transformer."):
+                new_key = "backbone.transformer." + key[len("mano_head.transformer."):]
+            # decshape head: mano_head.decshape.* → backbone.decshape.*
+            elif key.startswith("mano_head.decshape."):
+                new_key = "backbone.decshape." + key[len("mano_head.decshape."):]
+            # init_betas buffer
+            elif key == "mano_head.init_betas":
+                new_key = "backbone.init_betas"
+            # Skip unrelated keys: decpose, deccam, discriminator, mano buffers, etc.
+            elif key.startswith("mano_head.") or key.startswith("discriminator.") or key.startswith("mano.") or key == "initialized":
+                continue
+            remapped[new_key] = value
+
+        result = super().load_state_dict(remapped, strict=strict)
+
+        for param in self.backbone.decshape.parameters():
+            param.requires_grad = False
+
+        return result
+
     def _empty_output(self, imgs: torch.Tensor, owner_index: torch.Tensor, hand_is_right: torch.Tensor) -> dict[str, torch.Tensor]:
         return {
             "hand_queries": imgs.new_zeros((0, self.output_dim)),
+            "hand_betas": imgs.new_zeros((0, 10)),
             "owner_index": owner_index.new_zeros((0, 3)),
             "hand_is_right": hand_is_right.new_zeros((0,), dtype=hand_is_right.dtype),
             "crop_boxes": imgs.new_zeros((0, 4)),
@@ -118,10 +147,11 @@ class HaMeREncoder(nn.Module):
 
         crop_batch = torch.stack(crops, dim=0)
         valid_right_tensor = torch.stack(valid_right)
-        hand_queries = self.backbone(crop_batch, valid_right_tensor)
+        hand_queries, hand_betas = self.backbone(crop_batch, valid_right_tensor)
 
         return {
             "hand_queries": hand_queries,
+            "hand_betas": hand_betas,
             "owner_index": torch.stack(valid_owner),
             "hand_is_right": valid_right_tensor,
             "crop_boxes": torch.stack(valid_boxes),

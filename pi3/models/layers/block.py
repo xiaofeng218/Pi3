@@ -523,9 +523,29 @@ class HOBlockRope(nn.Module):
 
 
 def _copy_module_state(dst: nn.Module, src: nn.Module) -> None:
-    if type(dst) is not type(src):
-        raise TypeError(f"Cannot copy state from {type(src).__name__} to {type(dst).__name__}")
-    dst.load_state_dict(src.state_dict())
+    src_state = src.state_dict()
+    dst_state = dst.state_dict()
+
+    transferable = {}
+    for key, value in src_state.items():
+        if key not in dst_state:
+            continue
+        if dst_state[key].shape != value.shape:
+            raise RuntimeError(
+                f"Cannot copy key '{key}' from {type(src).__name__} to {type(dst).__name__}: "
+                f"shape mismatch {tuple(value.shape)} != {tuple(dst_state[key].shape)}"
+            )
+        transferable[key] = value
+
+    missing_in_src = [key for key in dst_state.keys() if key not in src_state]
+    non_lora_missing = [key for key in missing_in_src if "lora_" not in key]
+    if non_lora_missing:
+        raise RuntimeError(
+            f"Cannot warm-start {type(dst).__name__} from {type(src).__name__}; "
+            f"non-LoRA keys are missing from source: {non_lora_missing}"
+        )
+
+    dst.load_state_dict(transferable, strict=False)
 
 
 def init_ho_block_from_decoder_block(ho_blk: HOBlockRope, blk: nn.Module, cross_scale: float = 1e-3) -> None:

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# This file is meant to be sourced into an interactive shell.
+# Explicitly disable options that would kill or destabilize the session.
+set +e +u +o pipefail 2>/dev/null || true
 
 if [ -n "${ZSH_VERSION:-}" ]; then
     ASSET_REGISTRY_SOURCE="${(%):-%x}"
@@ -24,7 +26,7 @@ export HAMER_CACHE_DIR="${HAMER_CACHE_DIR:-$PI3_MODEL_ROOT/hamer/_DATA}"
 export HAMER_ENCODER_CKPT="${HAMER_ENCODER_CKPT:-$HAMER_CACHE_DIR/hamer_ckpts/checkpoints/hamer.ckpt}"
 export MANO_ROOT="${MANO_ROOT:-$HAMER_CACHE_DIR/data/mano}"
 
-export PI3X_CKPT="${PI3X_CKPT:-$PI3_MODEL_ROOT/pi3x/Pi3X}"
+export PI3X_CKPT="${PI3X_CKPT:-$PI3_MODEL_ROOT/pi3x}"
 export HF_HOME="${HF_HOME:-$PI3_MODEL_ROOT/huggingface}"
 
 export PYTHONPATH="$PI3_REPO_ROOT:$PI3_REPO_ROOT/dex-ycb-toolkit${PYTHONPATH:+:$PYTHONPATH}"

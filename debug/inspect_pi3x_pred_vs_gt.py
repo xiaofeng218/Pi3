@@ -46,6 +46,13 @@ from datasets.dexycb_dataset import DexYCBDataset
 from pi3.models.pi3x import Pi3X
 from pi3.models.hamer.mano_layer import build_mano_layer
 from pi3.models.hamer.geometry import rot6d_to_rotmat
+from pi3.visualization.pi3x_rerun_export import (
+    _build_object_asset_transform,
+    _load_textured_object_mesh,
+    _log_textured_object_mesh_timeless,
+    _log_textured_object_pose_or_clear,
+    _set_frame_time,
+)
 
 
 _YCB_CLASS_NAMES = (
@@ -97,6 +104,8 @@ _YCB_COLORS = {
     21: (0, 0, 192),
 }
 _HAND_COLOR = (230, 230, 230)
+_PRED_HAND_JOINT_COLOR = (64, 196, 255)
+_HAND_JOINT_CORRESPONDENCE_COLOR = (255, 140, 64)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -617,6 +626,29 @@ def _select_pred_hand_vertices(pred, sample_index, frame_idx):
     return pred_vertices[0] if pred_vertices.ndim >= 3 and pred_vertices.shape[0] > 0 else None
 
 
+def _select_pred_hand_joints(pred, sample_index, frame_idx):
+    pred_joints = pred.get("pred_hand_joints_3d", None)
+    if pred_joints is None:
+        return None
+
+    if not torch.is_tensor(pred_joints):
+        pred_joints = torch.as_tensor(pred_joints)
+
+    hand_owner_index = pred.get("hand_owner_index", None)
+    if hand_owner_index is not None and torch.is_tensor(hand_owner_index) and hand_owner_index.numel() > 0:
+        matches = (hand_owner_index[:, 0] == sample_index) & (hand_owner_index[:, 1] == frame_idx)
+        if matches.any():
+            return pred_joints[matches.nonzero(as_tuple=False)[0, 0]]
+
+    if pred_joints.ndim >= 4 and pred_joints.shape[0] > sample_index and pred_joints.shape[1] > frame_idx:
+        return pred_joints[sample_index, frame_idx]
+
+    if pred_joints.ndim >= 3 and pred_joints.shape[0] > sample_index:
+        return pred_joints[sample_index]
+
+    return pred_joints[0] if pred_joints.ndim >= 3 and pred_joints.shape[0] > 0 else None
+
+
 def _build_pred_object_mesh_vertices(pred, sample_index, frame_idx, template_vertices, normalization_center, normalization_scale):
     rot6d = pred.get("pred_object_rot6d", None)
     trans = pred.get("pred_object_trans", None)
@@ -685,6 +717,56 @@ def _log_mesh_or_clear(rr, entity_path, vertices, faces, color):
     )
 
 
+def _log_hand_joint_correspondence_or_clear(rr, entity_path, gt_joints, pred_joints, color):
+    if gt_joints is None or pred_joints is None:
+        rr.log(entity_path, rr.Clear(recursive=False))
+        return
+    gt_joints = np.asarray(gt_joints, dtype=np.float32)
+    pred_joints = np.asarray(pred_joints, dtype=np.float32)
+    if gt_joints.shape != pred_joints.shape or gt_joints.ndim != 2 or gt_joints.shape[1] != 3:
+        rr.log(entity_path, rr.Clear(recursive=False))
+        return
+    strips = np.stack([gt_joints, pred_joints], axis=1)
+    rr.log(
+        entity_path,
+        rr.LineStrips3D(
+            strips=strips,
+            colors=np.repeat(np.array([[*color, 255]], dtype=np.uint8), strips.shape[0], axis=0),
+        ),
+    )
+
+
+def _build_debug_gt_object_asset_transform(object_pose, display_scale):
+    pose = object_pose.detach().cpu().float().clone()
+    pose[:3, :3] /= float(display_scale)
+    pose[:3, 3] /= float(display_scale)
+    return pose
+
+
+def _build_debug_pred_object_asset_transform(pred, sample_index, frame_idx, normalization_center, normalization_scale):
+    rot6d = pred.get("pred_object_rot6d", None)
+    trans = pred.get("pred_object_trans", None)
+    scale = pred.get("pred_object_scale", None)
+    object_valid = pred.get("object_valid", None)
+    if rot6d is None or trans is None or scale is None:
+        return None
+    if object_valid is not None:
+        if torch.is_tensor(object_valid):
+            if object_valid.ndim >= 2 and not bool(object_valid[sample_index, frame_idx]):
+                return None
+        elif not bool(object_valid):
+            return None
+
+    pred_rot = rot6d_to_rotmat(rot6d[sample_index, frame_idx].detach().cpu().float().reshape(1, 6)).reshape(3, 3)
+    pred_trans = trans[sample_index, frame_idx].detach().cpu().float().reshape(3)
+    pred_scale = scale[sample_index, frame_idx].detach().cpu().float().reshape(-1)[:1]
+    normalization_scale = torch.as_tensor(normalization_scale, dtype=pred_rot.dtype).reshape(-1)[:1].clamp_min(1e-6)
+    pose = torch.eye(4, dtype=pred_rot.dtype)
+    pose[:3, :3] = pred_rot
+    pose[:3, 3] = pred_trans
+    return _build_object_asset_transform(pose, normalization_center, pred_scale / normalization_scale)
+
+
 def export_rrd_comparison(output_path, batch, pred, gt, sample_index, data_root):
     rr = _load_rerun()
     output_path = Path(output_path)
@@ -694,10 +776,21 @@ def export_rrd_comparison(output_path, batch, pred, gt, sample_index, data_root)
     rr.save(str(output_path))
     rr.log("world/camera", rr.ViewCoordinates.RDF)
 
+    object_asset_by_path = {
+        "world/gt_object_asset": None,
+        "world/pred_object_asset": None,
+    }
+    if batch and bool(batch[0]["object_multiview"]["grasped_object_valid"][sample_index]):
+        object_id = int(batch[0]["object_multiview"]["grasped_object_id"][sample_index])
+        textured_object_mesh = _load_textured_object_mesh(str(Path(data_root).resolve()), object_id)
+        for entity_path in object_asset_by_path:
+            _log_textured_object_mesh_timeless(rr, entity_path, textured_object_mesh)
+            object_asset_by_path[entity_path] = textured_object_mesh
+
     gt_pts = gt["local_points"][sample_index] if gt["local_points"].ndim == 4 else gt["local_points"][sample_index]
     # shapes are [B, N, H, W, 3]
     for frame_idx, view in enumerate(batch):
-        rr.set_time_sequence("frame", frame_idx)
+        _set_frame_time(rr, frame_idx)
         rgb = _tensor_rgb_to_uint8(view["img"][sample_index])
         valid_mask = gt["valid_masks"][sample_index, frame_idx]
         hand = view["hand"]
@@ -750,21 +843,18 @@ def export_rrd_comparison(output_path, batch, pred, gt, sample_index, data_root)
 
         rr.log("frames/gt_depth", rr.Image(gt_depth))
 
-        object_vertices = None
-        pred_object_vertices = None
-        object_faces = None
+        gt_object_asset_transform = None
+        pred_object_asset_transform = None
         if bool(object_multiview["grasped_object_valid"][sample_index]):
             object_id = int(object_multiview["grasped_object_id"][sample_index])
             object_pose = object_multiview["grasped_object_pose_obj2cam"][sample_index].detach().cpu().float()
             if not torch.allclose(object_pose, torch.zeros_like(object_pose)):
-                template_vertices, object_faces = _load_object_mesh_template(str(Path(data_root).resolve()), object_id)
-                object_vertices = _transform_vertices(template_vertices, object_pose) / display_scale
+                gt_object_asset_transform = _build_debug_gt_object_asset_transform(object_pose, display_scale)
                 if pred is not None and "normalization_center" in object_multiview and "normalization_scale" in object_multiview:
-                    pred_object_vertices = _build_pred_object_mesh_vertices(
+                    pred_object_asset_transform = _build_debug_pred_object_asset_transform(
                         pred=pred,
                         sample_index=sample_index,
                         frame_idx=frame_idx,
-                        template_vertices=template_vertices,
                         normalization_center=object_multiview["normalization_center"],
                         normalization_scale=object_multiview["normalization_scale"],
                     )
@@ -772,6 +862,8 @@ def export_rrd_comparison(output_path, batch, pred, gt, sample_index, data_root)
         hand_vertices = None
         hand_faces = None
         pred_hand_vertices = None
+        gt_hand_joints_np = None
+        pred_hand_joints_np = None
         hand_pose_mano = torch.cat(
             [hand["pose_mano"][sample_index], hand["hand_transl"][sample_index]],
             dim=0,
@@ -787,21 +879,15 @@ def export_rrd_comparison(output_path, batch, pred, gt, sample_index, data_root)
             hand_vertices = hand_vertices / display_scale
         if pred is not None:
             pred_hand_vertices = _select_pred_hand_vertices(pred, sample_index, frame_idx)
+            pred_hand_joints = _select_pred_hand_joints(pred, sample_index, frame_idx)
+            if pred_hand_joints is not None:
+                pred_hand_joints_np = _to_numpy(pred_hand_joints)
 
-        _log_mesh_or_clear(
-            rr,
-            "world/gt_object_mesh",
-            object_vertices,
-            object_faces,
-            _YCB_COLORS.get(int(object_multiview["grasped_object_id"][sample_index]), (180, 180, 180)),
-        )
-        _log_mesh_or_clear(
-            rr,
-            "world/pred_object_mesh",
-            pred_object_vertices,
-            object_faces,
-            _YCB_COLORS.get(int(object_multiview["grasped_object_id"][sample_index]), (180, 180, 180)),
-        )
+        if bool(hand["valid"][sample_index]) and "joints_3d_cam" in hand:
+            gt_hand_joints_np = hand["joints_3d_cam"][sample_index].detach().cpu().numpy() / display_scale
+
+        _log_textured_object_pose_or_clear(rr, "world/gt_object_asset", gt_object_asset_transform)
+        _log_textured_object_pose_or_clear(rr, "world/pred_object_asset", pred_object_asset_transform)
         _log_mesh_or_clear(
             rr,
             "world/gt_hand_mesh",
@@ -815,6 +901,33 @@ def export_rrd_comparison(output_path, batch, pred, gt, sample_index, data_root)
             pred_hand_vertices,
             hand_faces,
             _HAND_COLOR,
+        )
+        if gt_hand_joints_np is not None:
+            rr.log(
+                "world/gt_hand_joints",
+                rr.Points3D(
+                    positions=np.asarray(gt_hand_joints_np, dtype=np.float32),
+                    colors=_solid_vertex_rgba(len(gt_hand_joints_np), _HAND_COLOR),
+                ),
+            )
+        else:
+            rr.log("world/gt_hand_joints", rr.Clear(recursive=False))
+        if pred_hand_joints_np is not None:
+            rr.log(
+                "world/pred_hand_joints",
+                rr.Points3D(
+                    positions=np.asarray(pred_hand_joints_np, dtype=np.float32),
+                    colors=_solid_vertex_rgba(len(pred_hand_joints_np), _PRED_HAND_JOINT_COLOR),
+                ),
+            )
+        else:
+            rr.log("world/pred_hand_joints", rr.Clear(recursive=False))
+        _log_hand_joint_correspondence_or_clear(
+            rr,
+            "world/hand_joint_correspondence",
+            gt_hand_joints_np,
+            pred_hand_joints_np,
+            _HAND_JOINT_CORRESPONDENCE_COLOR,
         )
 
         if mask_np.any():

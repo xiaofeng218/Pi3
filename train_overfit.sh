@@ -1,3 +1,9 @@
-export CUDA_VISIBLE_DEVICES=0
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-python scripts/train_pi3x.py --config-name overfit
+#!/usr/bin/env bash
+set -euo pipefail
+
+EXPERIMENT="${1:?Usage: $0 <experiment_name>}"
+source asset_registry/env.sh
+python scripts/train_pi3x.py --config-name overfit \
+    "name=${EXPERIMENT}" \
+    "log.output_dir=outputs/${EXPERIMENT}" \
+    "log.ckpt_dir=outputs/${EXPERIMENT}/ckpts" \

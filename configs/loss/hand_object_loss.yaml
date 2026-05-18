@@ -2,8 +2,30 @@ train_loss:
   _target_: pi3.models.hand_object_loss.HandObjectLoss
   root_index: 0
   geom_weight: 1.0
+  hand_transl_weight: 1.0
+  hand_full_scale_weight: 1
+  hand_global_orient_weight: 1
+  hand_pose_weight: 0.5
+  hand_joints_3d_weight: 0.5
+  hand_2d_weight: 1.0
+  hand_adversarial_weight: 0.1
+  object_rot_weight: 1.0
+  object_transl_weight: 1.0
+  object_scale_weight: 0.5
+  hand_discriminator_ckpt: ${model.hamer_cache_dir}/hamer_ckpts/checkpoints/hamer.ckpt
 
 test_loss:
   _target_: pi3.models.hand_object_loss.HandObjectLoss
   root_index: 0
   geom_weight: 1.0
+  hand_transl_weight: 1.0
+  hand_full_scale_weight: 1
+  hand_global_orient_weight: 1
+  hand_pose_weight: 0.5
+  hand_joints_3d_weight: 0.5
+  hand_2d_weight: 1.0
+  hand_adversarial_weight: 0.1
+  object_rot_weight: 1.0
+  object_transl_weight: 1.0
+  object_scale_weight: 0.5
+  hand_discriminator_ckpt: ${model.hamer_cache_dir}/hamer_ckpts/checkpoints/hamer.ckpt

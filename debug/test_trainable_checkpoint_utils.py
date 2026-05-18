@@ -53,6 +53,5 @@ class TrainableCheckpointUtilsTests(unittest.TestCase):
             self.assertTrue(torch.allclose(module.trainable.weight, torch.load(tmpdir / "trainable_model.pt")["trainable.weight"]))
             self.assertTrue(torch.all(module.frozen.weight == 0.0))
 
-
 if __name__ == "__main__":
     unittest.main()

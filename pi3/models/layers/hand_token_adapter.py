@@ -100,6 +100,7 @@ class HandTokenAdapter(nn.Module):
         owner_index: torch.Tensor,
         batch_size: int,
         num_views: int,
+        feature_dim: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         if owner_index.numel() == 0:
             return None, None, None, 0
@@ -108,8 +109,9 @@ class HandTokenAdapter(nn.Module):
         if max_slot >= self.max_num_hands:
             raise ValueError(f"owner_index slot must be < {self.max_num_hands}, got {max_slot}")
         num_hand_tokens = max_slot + 1
+        dim = feature_dim if feature_dim is not None else self.token_dim
 
-        dense_tokens = self.empty_hand_token.expand(batch_size, num_views, num_hand_tokens, self.token_dim).clone()
+        dense_tokens = sparse_tokens.new_zeros((batch_size, num_views, num_hand_tokens, dim))
         dense_pos = owner_index.new_zeros((batch_size, num_views, num_hand_tokens, 2))
         dense_valid_mask = torch.zeros((batch_size, num_views, num_hand_tokens), dtype=torch.bool, device=owner_index.device)
 
@@ -129,7 +131,9 @@ class HandTokenAdapter(nn.Module):
         owner_index: torch.Tensor,
         hand_is_right: torch.Tensor,
         image_hw: tuple[int, int],
+        hand_betas: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | int | None]:
+        # TODO 1.2: 明显没有必要设置这个函数，mask形状规范一下就行
         hand_masks = self._normalize_mask_shape(hand_masks)
         if hand_masks.shape[0] != hand_queries.shape[0]:
             raise ValueError("hand_masks and hand_queries must align row-wise")
@@ -137,20 +141,36 @@ class HandTokenAdapter(nn.Module):
             raise ValueError("hand_masks, owner_index, and hand_is_right must align row-wise")
         if hand_queries.shape[-1] != self.token_dim:
             raise ValueError("hand_queries last dimension must match token_dim")
+        if hand_betas is not None and hand_betas.shape[0] != hand_queries.shape[0]:
+            raise ValueError("hand_betas and hand_queries must align row-wise")
 
+        # 处理完全没有手的情况，因为要保证所有的情况下手相关的损失都走一遍计算图，多卡运算时需要保证计算图一致，这样多卡计算梯度就不会空等。
         if hand_queries.shape[0] == 0:
+            batch_size, num_views = rgb_patch_tokens.shape[:2]
+            dummy_query = rgb_patch_tokens.new_zeros((1, self.token_dim))
+            dummy_side = torch.zeros((1,), dtype=torch.long, device=rgb_patch_tokens.device)
+            dummy_rgb = rgb_patch_tokens.new_zeros((1, self.token_dim))
+            dummy_token = self.fuse_mlp(torch.cat([dummy_query + self.side_embed(dummy_side), dummy_rgb], dim=-1))
+            dense_tokens = self.empty_hand_token.expand(batch_size, num_views, 1, self.token_dim).clone()
+            dense_tokens = dense_tokens + dummy_token.view(1, 1, 1, self.token_dim)
+            dense_pos = owner_index.new_zeros((batch_size, num_views, 1, 2))
+            dense_valid_mask = torch.zeros((batch_size, num_views, 1), dtype=torch.bool, device=rgb_patch_tokens.device)
+            dense_betas = rgb_patch_tokens.new_zeros((batch_size, num_views, 1, 10))
             return {
                 "sparse_tokens": hand_queries.new_zeros((0, self.token_dim)),
                 "sparse_pos": owner_index.new_zeros((0, 2)),
-                "dense_tokens": None,
-                "dense_pos": None,
-                "dense_valid_mask": None,
-                "num_hand_tokens": 0,
+                "sparse_betas": rgb_patch_tokens.new_zeros((0, 10)),
+                "dense_tokens": dense_tokens,
+                "dense_pos": dense_pos,
+                "dense_valid_mask": dense_valid_mask,
+                "num_hand_tokens": 1,
+                "dense_betas": dense_betas,
             }
 
         dino_hand_feat, sparse_pos = self._pool_rgb_features(rgb_patch_tokens, hand_masks, owner_index, image_hw)
         query_with_side = hand_queries + self.side_embed(hand_is_right.long())
         sparse_tokens = self.fuse_mlp(torch.cat([query_with_side, dino_hand_feat], dim=-1))
+        sparse_betas = hand_betas if hand_betas is not None else rgb_patch_tokens.new_zeros((sparse_tokens.shape[0], 10))
         dense_tokens, dense_pos, dense_valid_mask, num_hand_tokens = self._scatter_dense(
             sparse_tokens,
             sparse_pos,
@@ -158,11 +178,21 @@ class HandTokenAdapter(nn.Module):
             batch_size=rgb_patch_tokens.shape[0],
             num_views=rgb_patch_tokens.shape[1],
         )
+        dense_betas, _, _, _ = self._scatter_dense(
+            sparse_betas,
+            torch.zeros_like(sparse_pos),
+            owner_index,
+            batch_size=rgb_patch_tokens.shape[0],
+            num_views=rgb_patch_tokens.shape[1],
+            feature_dim=10,
+        )
         return {
             "sparse_tokens": sparse_tokens,
             "sparse_pos": sparse_pos,
+            "sparse_betas": sparse_betas,
             "dense_tokens": dense_tokens,
             "dense_pos": dense_pos,
             "dense_valid_mask": dense_valid_mask,
             "num_hand_tokens": num_hand_tokens,
+            "dense_betas": dense_betas,
         }

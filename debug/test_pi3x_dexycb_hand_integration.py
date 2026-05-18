@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import shutil
 from pathlib import Path
+from unittest import mock
 
 import torch
 from torch.utils.data import DataLoader
@@ -199,14 +200,15 @@ class Pi3XDexYCBHandIntegrationTests(unittest.TestCase):
             self.assertEqual(tuple(hand_inputs["gt_joints_2d"].shape[1:]), (21, 2))
             self.assertEqual(hand_inputs["gt_pose_mano"].shape[0], hamer_out["hand_queries"].shape[0])
 
-            model = Pi3X(use_multimodal=False, hand_mano_layer=_FakeMANO()).eval()
+            fake_mano = {"right": _FakeMANO(), "left": _FakeMANO()}
+            with mock.patch.object(Pi3X, "_build_hand_mano_layer", return_value=fake_mano), mock.patch.object(Pi3X, "_build_hand_encoder", return_value=encoder):
+                model = Pi3X(use_multimodal=False).eval()
             with torch.no_grad():
                 out = model(
                     hand_inputs["imgs"],
-                    hand_queries=hamer_out["hand_queries"],
                     hand_masks=hand_inputs["hand_masks"],
-                    hand_owner_index=hamer_out["owner_index"],
-                    hand_is_right=hamer_out["hand_is_right"],
+                    hand_owner_index=hand_inputs["owner_index"],
+                    hand_is_right=hand_inputs["hand_is_right"],
                 )
 
             self.assertIn("pred_hand_mano_params", out)
@@ -216,6 +218,7 @@ class Pi3XDexYCBHandIntegrationTests(unittest.TestCase):
             self.assertIn("pred_hand_transl", out)
             self.assertIn("pred_hand_log_scale", out)
             self.assertIn("pred_hand_scale", out)
+            self.assertIn("pred_hand_mano_betas", out)
             self.assertIn("pred_hand_vertices", out)
             self.assertIn("pred_hand_joints_3d", out)
             self.assertEqual(tuple(out["pred_hand_transl_dir"].shape), hand_inputs["gt_hand_transl"].shape)
@@ -227,6 +230,7 @@ class Pi3XDexYCBHandIntegrationTests(unittest.TestCase):
             self.assertTrue(torch.allclose(out["pred_hand_transl"], out["pred_hand_transl_dir"] * out["pred_hand_transl_scale"]))
             self.assertTrue(torch.allclose(out["pred_hand_transl_scale"], torch.exp(out["pred_hand_transl_log_scale"])))
             self.assertTrue(torch.allclose(out["pred_hand_scale"], torch.exp(out["pred_hand_log_scale"])))
+            self.assertEqual(out["pred_hand_mano_betas"].shape, hand_inputs["gt_mano_betas"].shape)
             self.assertEqual(tuple(out["pred_hand_vertices"].shape), (hamer_out["hand_queries"].shape[0], 778, 3))
             self.assertEqual(tuple(out["pred_hand_joints_3d"].shape), (hamer_out["hand_queries"].shape[0], 21, 3))
             self.assertEqual(tuple(out["pred_hand_mano_params"]["global_orient"].shape[1:]), (1, 3, 3))

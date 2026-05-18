@@ -274,25 +274,54 @@ def transpose_to_landscape(view):
         view['camera_intrinsics'] = view['camera_intrinsics'][[1, 0, 2]]
 
 def unified_collate_fn(batch):
+    def _is_view_dict_list(value):
+        return isinstance(value, list) and all(isinstance(item, dict) for item in value)
+
+    def _collate_view_dict_lists(view_batch):
+        views_num = len(view_batch[0])
+        all_keys = view_batch[0][0].keys()
+
+        batched_data = [{key: [] for key in all_keys} for _ in range(views_num)]
+        for sample in view_batch:
+            for i in range(views_num):
+                for key in all_keys:
+                    batched_data[i][key].append(sample[i].get(key, None))
+
+        for i in range(views_num):
+            for key, data in batched_data[i].items():
+                batched_data[i][key] = _recursive_collate(data)
+
+        return batched_data
+
+    def _collapse_singletons(value):
+        while isinstance(value, list) and len(value) == 1 and not _is_view_dict_list(value):
+            value = value[0]
+        return value
+
+    def _recursive_collate(data):
+        if isinstance(data, dict):
+            return {key: _recursive_collate(value) for key, value in data.items()}
+        if not isinstance(data, list):
+            return data
+        if not data:
+            return data
+        if all(_is_view_dict_list(item) for item in data):
+            return _collate_view_dict_lists(data)
+        if all(isinstance(item, dict) for item in data):
+            keys = data[0].keys()
+            return {key: _recursive_collate([item.get(key, None) for item in data]) for key in keys}
+        try:
+            return default_collate(data)
+        except Exception:
+            return data
+
+    batch = [_collapse_singletons(sample) for sample in batch]
+
+    if isinstance(batch[0], dict) and not _is_view_dict_list(batch[0]):
+        return _recursive_collate(batch)
     if isinstance(batch[0], dict):
         batch = [batch]
-    views_num = len(batch[0])
-    all_keys = batch[0][0].keys()
-
-    batched_data = [{key: [] for key in all_keys} for _ in range(views_num)]
-    for sample in batch:
-        for i in range(views_num):
-            for key in all_keys:
-                batched_data[i][key].append(sample[i].get(key, None))
-
-    for i in range(views_num):
-        for key, data in batched_data[i].items():
-            try:
-                batched_data[i][key] = default_collate(data)
-            except Exception:
-                batched_data[i][key] = data
-
-    return batched_data
+    return _collate_view_dict_lists(batch)
 
 def add_noise(dep, input_noise, generator=None):
     # add noise

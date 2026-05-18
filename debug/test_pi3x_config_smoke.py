@@ -21,8 +21,25 @@ class Pi3XConfigSmokeTests(unittest.TestCase):
         self.assertIn("configs/hamer/model_config.yaml", cfg.hand_encoder.config_file)
         self.assertIn("data/model/hamer/_DATA", cfg.model.hamer_cache_dir)
         self.assertIn("data/model/hamer/_DATA", cfg.hand_encoder.cache_dir)
+        self.assertEqual(cfg.train.num_workers, 0)
+        self.assertEqual(cfg.test.num_workers, 0)
+        self.assertEqual(list(cfg.test.image_num_range), [12, 12])
+        self.assertFalse(cfg.train_dataloader.persistent_workers)
+        self.assertFalse(cfg.test_dataloader.persistent_workers)
         self.assertNotIn("third_party", cfg.model.hamer_config_file)
         self.assertNotIn("third_party", cfg.hand_encoder.config_file)
+
+    def test_overfit_config_composes(self) -> None:
+        config_dir = str(Path(__file__).resolve().parents[1] / "configs")
+        with initialize_config_dir(config_dir=config_dir, job_name="pi3x_overfit_smoke", version_base=None):
+            cfg = compose(config_name="overfit")
+        self.assertEqual(cfg.name, "pi3x_overfit")
+        self.assertTrue(cfg.test.use_train_loader)
+        self.assertEqual(cfg.train_dataset.max_tracks, 1)
+        self.assertEqual(cfg.train.iters_per_epoch, 100)
+        self.assertEqual(cfg.train.num_workers, 0)
+        self.assertEqual(cfg.test.num_workers, 0)
+        self.assertFalse(cfg.train.auto_resume)
 
 
 if __name__ == "__main__":

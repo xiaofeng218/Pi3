@@ -6,13 +6,12 @@ from pathlib import Path
 
 import hydra
 import torch
-from PIL import Image as PILImage
-
 from pi3.models.hand_object_loss import estimate_scene_scale_from_depth
 from pi3.visualization import pi3x_rerun_export as vis_export
 from pi3.visualization import export_pi3x_rerun_sample
 from trainers.checkpoint_utils import load_trainable_checkpoint, save_trainable_checkpoint
 from trainers.base_trainer_accelerate import BaseTrainer
+from trainers.pi3x_batch_utils import build_precomputed_pi3x_sample
 from trainers.pi3x_training_policy import apply_pi3x_training_policy
 
 
@@ -20,12 +19,6 @@ def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
     if isinstance(cfg, dict):
         return cfg.get(key, default)
     return getattr(cfg, key, default)
-
-
-def _as_bool(value: Any) -> bool:
-    if torch.is_tensor(value):
-        return bool(value.item())
-    return bool(value)
 
 
 class _LossOutput(dict):
@@ -40,26 +33,18 @@ class _LossOutput(dict):
 class Pi3XTrainer(BaseTrainer):
     def __init__(self, cfg):
         self._loss_cfg = cfg.loss.train_loss
-        self._hand_encoder_cfg = cfg.get("hand_encoder", None)
+        self._test_loss_cfg = cfg.loss.test_loss
         self._vis_cfg = _cfg_get(cfg, "vis", {})
         super().__init__(cfg)
-        self.train_loss = hydra.utils.instantiate(self._loss_cfg)
-        self.test_loss = hydra.utils.instantiate(self._loss_cfg)
-        self.hand_encoder = self._build_hand_encoder()
+        self.train_loss = hydra.utils.instantiate(self._loss_cfg).to(self.accelerator.device)
+        self.test_loss = hydra.utils.instantiate(self._test_loss_cfg).to(self.accelerator.device)
 
-    def _build_hand_encoder(self):
-        if self._hand_encoder_cfg is None:
-            return None
-        hand_encoder = hydra.utils.instantiate(self._hand_encoder_cfg)
-        hand_encoder.eval()
-        for param in hand_encoder.parameters():
-            param.requires_grad = False
-        return hand_encoder.to(self.accelerator.device)
+    @property
+    def _base_model(self):
+        return self.model.module if hasattr(self.model, "module") else self.model
 
     def prepare_model(self):
         model = super().prepare_model()
-        # Materialize the lazy hand head before parameter counting / optimizer setup.
-        model._get_hand_mano_head(torch.device("cpu"))
         load_report = getattr(model, "_last_load_report", None)
         if load_report is not None:
             self.log_info(
@@ -67,9 +52,6 @@ class Pi3XTrainer(BaseTrainer):
                 f"missing={len(load_report.missing_keys)}, unexpected={len(load_report.unexpected_keys)}"
             )
         apply_pi3x_training_policy(model)
-        if hasattr(model, "hand_mano_head") and model.hand_mano_head is not None and hasattr(model.hand_mano_head, "mano"):
-            for param in model.hand_mano_head.mano.parameters():
-                param.requires_grad = False
         return model
 
     def build_optimizer(self, cfg_optimizer, model):
@@ -164,147 +146,12 @@ class Pi3XTrainer(BaseTrainer):
         if hasattr(self.test_loader, "batch_sampler") and hasattr(self.test_loader.batch_sampler, "set_epoch"):
             self.test_loader.batch_sampler.set_epoch(epoch, base_seed=self.cfg.train.base_seed)
 
-    def _stack_scene_inputs(self, batch):
-        imgs = torch.stack([view["img"] for view in batch], dim=1)
-        depths = torch.stack([view["depthmap"] for view in batch], dim=1)
-        intrinsics = torch.stack([view["camera_intrinsics"] for view in batch], dim=1)
-        poses = torch.stack([view["camera_pose"] for view in batch], dim=1)
-        scene_focus_masks = torch.stack(
-            [view["hand"]["mask"].bool() | view["object_multiview"]["grasped_object_mask"].bool() for view in batch],
-            dim=1,
-        )
-        object_masks = torch.stack([view["object_multiview"]["grasped_object_mask"].bool() for view in batch], dim=1)
-        object_valid = torch.stack([view["object_multiview"]["grasped_object_valid"].bool() for view in batch], dim=1)
-        object_multiview = dict(batch[0]["object_multiview"])
-        object_multiview["grasped_object_mask"] = object_masks
-        object_multiview["grasped_object_valid"] = object_valid
-        return imgs, depths, intrinsics, poses, scene_focus_masks, object_multiview
-
-    def _build_hand_inputs(self, batch, imgs):
-        batch_size = batch[0]["img"].shape[0]
-        hand_masks = []
-        owner_index = []
-        hand_is_right = []
-
-        for view_idx, view in enumerate(batch):
-            masks = view["hand"]["mask"]
-            valid = view["hand"]["valid"]
-            sides = view["hand"]["mano_side"]
-            for batch_idx in range(batch_size):
-                if not _as_bool(valid[batch_idx]) or not bool(masks[batch_idx].any()):
-                    continue
-                hand_masks.append(masks[batch_idx].float())
-                owner_index.append([batch_idx, view_idx, 0])
-                hand_is_right.append(sides[batch_idx] == "right")
-
-        device = imgs.device
-        height, width = imgs.shape[-2:]
-        if hand_masks:
-            hand_masks_tensor = torch.stack(hand_masks, dim=0).to(device=device)
-            owner_index_tensor = torch.tensor(owner_index, dtype=torch.long, device=device)
-            hand_is_right_tensor = torch.tensor(hand_is_right, dtype=torch.bool, device=device)
-        else:
-            hand_masks_tensor = imgs.new_zeros((0, height, width))
-            owner_index_tensor = torch.zeros((0, 3), dtype=torch.long, device=device)
-            hand_is_right_tensor = torch.zeros((0,), dtype=torch.bool, device=device)
-
-        return {
-            "hand_masks": hand_masks_tensor,
-            "owner_index": owner_index_tensor,
-            "hand_is_right": hand_is_right_tensor,
-        }
-
-    def _gather_hand_gt(self, batch, owner_index):
-        device = batch[0]["img"].device
-        gt_pose_mano = []
-        gt_hand_transl = []
-        gt_mano_betas = []
-        gt_joints_3d_cam = []
-        gt_hand_is_right = []
-
-        for hand_owner in owner_index.tolist():
-            batch_idx, view_idx, _ = hand_owner
-            view = batch[view_idx]
-            gt_pose_mano.append(view["hand"]["pose_mano"][batch_idx].float())
-            gt_hand_transl.append(view["hand"]["hand_transl"][batch_idx].float())
-            gt_mano_betas.append(view["hand"]["mano_betas"][batch_idx].float())
-            gt_joints_3d_cam.append(view["hand"]["joints_3d_cam"][batch_idx].float())
-            gt_hand_is_right.append(torch.tensor(view["hand"]["mano_side"][batch_idx] == "right", dtype=torch.bool))
-
-
-        if gt_pose_mano:
-            return {
-                "hand_valid": torch.ones((len(gt_pose_mano),), dtype=torch.bool, device=device),
-                "hand_pose_mano": torch.stack(gt_pose_mano, dim=0).to(device=device),
-                "hand_transl": torch.stack(gt_hand_transl, dim=0).to(device=device),
-                "hand_mano_betas": torch.stack(gt_mano_betas, dim=0).to(device=device),
-                "hand_joints_3d_cam": torch.stack(gt_joints_3d_cam, dim=0).to(device=device),
-                "hand_is_right": torch.stack(gt_hand_is_right, dim=0).to(device=device),
-            }
-
-        return {
-            "hand_valid": torch.zeros((0,), dtype=torch.bool, device=device),
-            "hand_pose_mano": torch.zeros((0, 48), dtype=torch.float32, device=device),
-            "hand_transl": torch.zeros((0, 3), dtype=torch.float32, device=device),
-            "hand_mano_betas": torch.zeros((0, 10), dtype=torch.float32, device=device),
-            "hand_joints_3d_cam": torch.zeros((0, 21, 3), dtype=torch.float32, device=device),
-            "hand_is_right": torch.zeros((0,), dtype=torch.bool, device=device)
-        }
-
-    def _compute_hand_gt_mesh(self, hand_gt):
-        """Compute GT hand vertices and joints by calling MANO (metric meters output)."""
-        device = hand_gt["hand_pose_mano"].device
-        N = hand_gt["hand_pose_mano"].shape[0]
-        if N == 0 or self.model.hand_mano_layer is None:
-            return (
-                hand_gt.get("hand_joints_3d_cam", torch.zeros((0, 21, 3), device=device)),
-                torch.zeros((0, 778, 3), device=device),
-            )
-
-        hand_pose = hand_gt["hand_pose_mano"].float()
-        hand_betas = hand_gt["hand_mano_betas"].float()
-        hand_transl = hand_gt["hand_transl"].float()  # m → mm for MANO
-        hand_is_right = hand_gt.get("hand_is_right", None)
-        if hand_is_right is None:
-            default_side = bool(getattr(self.model.hand_mano_layer, "is_rhand", True))
-            hand_is_right = torch.full((N,), default_side, dtype=torch.bool, device=device)
-
-        vertices = torch.zeros((N, 778, 3), dtype=hand_pose.dtype, device=device)
-        joints = torch.zeros((N, 21, 3), dtype=hand_pose.dtype, device=device)
-
-        for side_value in (True, False):
-            side_mask = hand_is_right == side_value
-            if not side_mask.any():
-                continue
-            side = "right" if side_value else "left"
-            if side not in self.model.hand_mano_layer:
-                continue
-            mano = self.model.hand_mano_layer[side]
-            idx = side_mask.nonzero(as_tuple=False).squeeze(-1)
-            with torch.no_grad():
-                mano_out = mano.forward(
-                    hand_pose[idx],
-                    hand_betas[idx],
-                    th_trans=hand_transl[idx],
-                )
-            vertices[idx] = mano_out.vertices.reshape(len(idx), -1, 3).to(dtype=hand_pose.dtype) / 1000.0  # mm → m
-            joints[idx] = mano_out.joints.reshape(len(idx), -1, 3).to(dtype=hand_pose.dtype) / 1000.0    # mm → m
-
-        return joints, vertices
-
-    def _build_object_gt(self, batch):
-        device = batch[0]["img"].device
-        object_pose = torch.stack([view["object_multiview"]["grasped_object_pose_obj2cam"] for view in batch], dim=1).to(device=device)
-        object_valid = torch.stack([view["object_multiview"]["grasped_object_valid"].bool() for view in batch], dim=1).to(device=device)
-        object_normalization_scale = batch[0]["object_multiview"]["normalization_scale"]
-        if not torch.is_tensor(object_normalization_scale):
-            object_normalization_scale = torch.as_tensor(object_normalization_scale)
-        object_normalization_scale = object_normalization_scale.to(device=device)
-        return {
-            "object_valid": object_valid,
-            "object_pose_obj2cam": object_pose,
-            "object_normalization_scale": object_normalization_scale,
-        }
+    def _sanitize_tensor(self, name, tensor, nan=0.0, posinf=0.0, neginf=0.0):
+        if not torch.is_tensor(tensor):
+            return tensor
+        if not (torch.is_floating_point(tensor) or torch.is_complex(tensor)):
+            return tensor
+        return torch.nan_to_num(tensor, nan=nan, posinf=posinf, neginf=neginf)
 
     def _vis_enabled(self):
         return bool(_cfg_get(self._vis_cfg, "enabled", False))
@@ -337,57 +184,147 @@ class Pi3XTrainer(BaseTrainer):
             raise RuntimeError("vis export requires data_root in the train/test dataset config")
         return data_root
 
-    def forward_batch(self, batch, mode="train"):
-        if isinstance(batch, dict):
-            pred = self.model(**batch)
-            return [pred, batch]
+    def _has_precomputed_sample(self, batch) -> bool:
+        return isinstance(batch, dict) and all(key in batch for key in ("views", "scene_inputs", "gt_metric", "gt_scale_meta"))
 
-        imgs, depths, intrinsics, poses, scene_focus_masks, object_multiview = self._stack_scene_inputs(batch)
-        hand_inputs = self._build_hand_inputs(batch, imgs)
+    def _has_views_sample(self, batch) -> bool:
+        return isinstance(batch, dict) and "views" in batch
 
-        if self.hand_encoder is None or hand_inputs["hand_masks"].shape[0] == 0:
-            hand_queries = None
-            hand_masks = None
-            hand_owner_index = None
-            hand_is_right = None
+    def _rebase_and_flatten_owner_index(self, owner_index: torch.Tensor) -> torch.Tensor:
+        if owner_index.ndim != 3 or owner_index.shape[-1] != 3:
+            raise ValueError(f"Expected owner_index with shape (B,N,3), got {tuple(owner_index.shape)}")
+        batch_size, num_views = owner_index.shape[:2]
+        rebased = owner_index.clone()
+        rebased[..., 0] = torch.arange(batch_size, device=owner_index.device, dtype=owner_index.dtype).view(batch_size, 1)
+        return rebased.reshape(batch_size * num_views, 3)
+
+    def _sparsify_hand_gt_from_dense(self, gt_metric, owner_index):
+        device = gt_metric["hand_valid"].device
+        if owner_index is None or owner_index.numel() == 0:
+            return {
+                "hand_valid": torch.zeros((1,), dtype=torch.bool, device=device),
+                "hand_pose_coeffs": gt_metric["hand_pose_coeffs"][:1, :1].reshape(1, -1) * 0.0,
+                "hand_transl": torch.zeros((1, 3), dtype=torch.float32, device=device),
+                "hand_mano_betas": gt_metric["hand_mano_betas"][:1, :1].reshape(1, -1) * 0.0,
+                "hand_joints_3d": torch.zeros((1, 21, 3), dtype=torch.float32, device=device),
+                "hand_joints_2d": torch.zeros((1, 21, 2), dtype=torch.float32, device=device),
+                "hand_camera_intrinsics": gt_metric["hand_camera_intrinsics"][:1, :1].reshape(1, 3, 3) * 0.0,
+                "hand_is_right": torch.zeros((1,), dtype=torch.bool, device=device),
+                "hand_owner_index": torch.zeros((1, 3), dtype=torch.long, device=device),
+            }
+
+        batch_idx = owner_index[:, 0].long()
+        view_idx = owner_index[:, 1].long()
+        return {
+            "hand_valid": gt_metric["hand_valid"][batch_idx, view_idx],
+            "hand_pose_coeffs": gt_metric["hand_pose_coeffs"][batch_idx, view_idx],
+            "hand_transl": gt_metric["hand_transl"][batch_idx, view_idx],
+            "hand_mano_betas": gt_metric["hand_mano_betas"][batch_idx, view_idx],
+            "hand_joints_3d": gt_metric["hand_joints_3d"][batch_idx, view_idx],
+            "hand_joints_2d": gt_metric["hand_joints_2d"][batch_idx, view_idx],
+            "hand_camera_intrinsics": gt_metric["hand_camera_intrinsics"][batch_idx, view_idx],
+            "hand_is_right": gt_metric["hand_is_right"][batch_idx, view_idx],
+            "hand_owner_index": owner_index,
+        }
+
+    def _decode_hand_pose_coeffs_to_rotmat(self, hand_pose_coeffs, hand_is_right):
+        mano_layer = getattr(self._base_model, "hand_mano_layer", None)
+        if mano_layer is None:
+            raise RuntimeError("hand_mano_layer is required to decode DexYCB hand pose coefficients")
+        batch_size = hand_pose_coeffs.shape[0]
+        global_orient = torch.zeros((batch_size, 1, 3, 3), dtype=hand_pose_coeffs.dtype, device=hand_pose_coeffs.device)
+        hand_pose = torch.zeros((batch_size, 15, 3, 3), dtype=hand_pose_coeffs.dtype, device=hand_pose_coeffs.device)
+
+        def _decode_with_layer(layer, mask):
+            idx = mask.nonzero(as_tuple=False).squeeze(-1)
+            decoded_global, decoded_pose = layer.decode_pose_coeffs_to_rotmat(hand_pose_coeffs[idx])
+            global_orient[idx] = decoded_global.to(dtype=hand_pose_coeffs.dtype, device=hand_pose_coeffs.device)
+            hand_pose[idx] = decoded_pose.to(dtype=hand_pose_coeffs.dtype, device=hand_pose_coeffs.device)
+
+        if isinstance(mano_layer, torch.nn.ModuleDict):
+            for side_value, side_name in ((True, "right"), (False, "left")):
+                side_mask = hand_is_right == side_value
+                if side_mask.any():
+                    _decode_with_layer(mano_layer[side_name], side_mask)
         else:
-            with torch.no_grad():
-                hand_encoder_out = self.hand_encoder(
-                    imgs,
-                    hand_inputs["hand_masks"],
-                    hand_inputs["owner_index"],
-                    hand_inputs["hand_is_right"],
+            _decode_with_layer(mano_layer, torch.ones((batch_size,), dtype=torch.bool, device=hand_pose_coeffs.device))
+        return global_orient, hand_pose
+
+    def forward_batch(self, batch, mode="train"):
+        del mode
+        if not self._has_views_sample(batch):
+            raise TypeError(
+                "Pi3XTrainer now expects a batch dict containing `views`."
+            )
+        if not self._has_precomputed_sample(batch):
+            batch = build_precomputed_pi3x_sample(batch)
+
+        views_batch = batch["views"]
+        scene_inputs = batch["scene_inputs"]
+        gt_metric_dense = batch["gt_metric"]
+        gt_scale_meta = batch["gt_scale_meta"]
+
+        imgs = self._sanitize_tensor("scene_inputs.imgs", scene_inputs["imgs"], nan=0.0, posinf=1.0, neginf=0.0)
+        depths = self._sanitize_tensor("scene_inputs.depths", scene_inputs["depths"], nan=0.0, posinf=0.0, neginf=0.0)
+        intrinsics = self._sanitize_tensor("scene_inputs.intrinsics", scene_inputs["intrinsics"], nan=0.0, posinf=0.0, neginf=0.0)
+        poses = self._sanitize_tensor("scene_inputs.poses", scene_inputs["poses"], nan=0.0, posinf=0.0, neginf=0.0)
+        object_masks = scene_inputs["object_masks"]
+        object_valid = scene_inputs["object_valid"]
+        object_multiview = scene_inputs["object_multiview"]
+        if object_multiview is not None:
+            object_multiview = dict(object_multiview)
+            if "img" in object_multiview:
+                object_multiview["img"] = self._sanitize_tensor(
+                    "scene_inputs.object_multiview.img",
+                    object_multiview["img"],
+                    nan=0.0,
+                    posinf=1.0,
+                    neginf=0.0,
                 )
-            valid_source_index = hand_encoder_out.get("source_index", None)
-            if valid_source_index is not None:
-                hand_masks = hand_inputs["hand_masks"].index_select(0, valid_source_index)
-            else:
-                hand_masks = hand_inputs["hand_masks"]
-            hand_queries = hand_encoder_out["hand_queries"]
-            hand_owner_index = hand_encoder_out["owner_index"]
-            hand_is_right = hand_encoder_out["hand_is_right"]
+            if "depthmap" in object_multiview:
+                object_multiview["depthmap"] = self._sanitize_tensor(
+                    "scene_inputs.object_multiview.depthmap",
+                    object_multiview["depthmap"],
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+            if "camera_intrinsics" in object_multiview:
+                object_multiview["camera_intrinsics"] = self._sanitize_tensor(
+                    "scene_inputs.object_multiview.camera_intrinsics",
+                    object_multiview["camera_intrinsics"],
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+            if "camera_pose" in object_multiview:
+                object_multiview["camera_pose"] = self._sanitize_tensor(
+                    "scene_inputs.object_multiview.camera_pose",
+                    object_multiview["camera_pose"],
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+        scene_focus_masks = gt_scale_meta["scene_focus_masks"]
 
-        resolved_owner = hand_owner_index if hand_owner_index is not None else hand_inputs["owner_index"]
+        hand_masks = scene_inputs["hand_masks"].reshape(-1, *scene_inputs["hand_masks"].shape[-2:])
+        hand_owner_index = self._rebase_and_flatten_owner_index(scene_inputs["hand_owner_index"])
+        hand_is_right = scene_inputs["hand_is_right"].reshape(-1)
 
-        # Step 1: Build GT in metric scale
-        hand_gt_metric = self._gather_hand_gt(batch, resolved_owner)
-        gt_hand_joints_metric, gt_hand_vertices_metric = self._compute_hand_gt_mesh(hand_gt_metric)
-        object_gt_metric = self._build_object_gt(batch)
-
-        # Step 2: Forward model
         model_kwargs = {
             "imgs": imgs,
-            "depths": depths if self.model.use_multimodal else None,
-            "intrinsics": intrinsics if self.model.use_multimodal else None,
-            "poses": poses if self.model.use_multimodal else None,
+            "depths": depths if self._base_model.use_multimodal else None,
+            "intrinsics": intrinsics if self._base_model.use_multimodal else None,
+            "poses": poses if self._base_model.use_multimodal else None,
             "with_prior": True,
-            "hand_queries": hand_queries,
             "hand_masks": hand_masks,
             "hand_owner_index": hand_owner_index,
             "hand_is_right": hand_is_right,
+            "object_masks": object_masks,
+            "object_valid": object_valid,
             "object_multiview": object_multiview,
         }
-        if self.model.use_multimodal:
+        if self._base_model.use_multimodal:
             bsz, num_views = imgs.shape[:2]
             full_mask = torch.ones((bsz, num_views), dtype=torch.bool, device=imgs.device)
             model_kwargs["mask_add_depth"] = full_mask
@@ -396,7 +333,9 @@ class Pi3XTrainer(BaseTrainer):
 
         pred = self.model(**model_kwargs)
 
-        # Step 3: Compute scene_scale (pred units / metric)
+        owner_for_gt = pred.get("hand_owner_index", None)
+        hand_gt_metric = self._sparsify_hand_gt_from_dense(gt_metric_dense, owner_for_gt)
+
         with torch.no_grad():
             scene_scale = estimate_scene_scale_from_depth(
                 pred["local_points"][..., 2].detach(),
@@ -405,34 +344,38 @@ class Pi3XTrainer(BaseTrainer):
                 focus_mask=scene_focus_masks,
             )
 
-        # Step 4: Build scene geometry GT in metric, then convert to pred scale
-        scene_gt_metric = vis_export.build_scene_gt_metric(batch)
-        gt = vis_export.convert_scene_gt_to_pred_scale(scene_gt_metric, scene_scale)
-        del scene_gt_metric
+            scene_gt_metric = vis_export.build_scene_gt_metric(views_batch)
+            scene_gt_metric["imgs"] = imgs
+            gt = vis_export.convert_scene_gt_to_pred_scale(scene_gt_metric, scene_scale)
+            del scene_gt_metric
 
-        # Step 5: Merge hand GT — joints/vertices stay metric, transl converted to pred scale
-        scale_per_hand = scene_scale[resolved_owner[:, 0]].view(-1, 1)
-        gt["hand_valid"] = hand_gt_metric["hand_valid"]
-        gt["hand_pose_mano"] = hand_gt_metric["hand_pose_mano"]
-        gt["hand_mano_betas"] = hand_gt_metric["hand_mano_betas"]
-        gt["hand_transl"] = hand_gt_metric["hand_transl"] * scale_per_hand
-        gt["hand_joints_3d"] = gt_hand_joints_metric
-        gt["hand_vertices"] = gt_hand_vertices_metric
-        gt["hand_is_right"] = hand_gt_metric["hand_is_right"]
-        gt["hand_owner_index"] = resolved_owner
+            owner_rows = hand_gt_metric["hand_owner_index"]
+            scale_per_hand = scene_scale[owner_rows[:, 0]].view(-1, 1)
+            gt_global_orient_rotmat, gt_hand_pose_rotmat = self._decode_hand_pose_coeffs_to_rotmat(
+                hand_gt_metric["hand_pose_coeffs"],
+                hand_gt_metric["hand_is_right"],
+            )
+            gt["hand_valid"] = hand_gt_metric["hand_valid"]
+            gt["hand_global_orient_rotmat"] = gt_global_orient_rotmat
+            gt["hand_pose_rotmat"] = gt_hand_pose_rotmat
+            gt["hand_mano_betas"] = hand_gt_metric["hand_mano_betas"]
+            gt["hand_transl"] = hand_gt_metric["hand_transl"] * scale_per_hand
+            gt["hand_scale"] = scale_per_hand
+            gt["hand_joints_3d"] = hand_gt_metric["hand_joints_3d"] * scale_per_hand.unsqueeze(1)
+            gt["hand_joints_2d"] = hand_gt_metric["hand_joints_2d"]
+            gt["hand_camera_intrinsics"] = hand_gt_metric["hand_camera_intrinsics"]
+            gt["hand_is_right"] = hand_gt_metric["hand_is_right"]
+            gt["hand_owner_index"] = owner_rows
 
-        # Step 6: Merge object GT — transl and normalization_scale converted to pred scale
-        scale_obj = scene_scale.view(-1, 1, 1)
-        obj_pose = object_gt_metric["object_pose_obj2cam"].clone()
-        obj_pose[..., :3, 3] = obj_pose[..., :3, 3] * scale_obj
-        gt["object_valid"] = object_gt_metric["object_valid"]
-        gt["object_pose_obj2cam"] = obj_pose
-        gt["object_normalization_scale"] = object_gt_metric["object_normalization_scale"] * scene_scale
-
-        del hand_gt_metric, gt_hand_joints_metric, gt_hand_vertices_metric, object_gt_metric
-
-        # Clear per-step intermediates to help GC
-        del model_kwargs, scene_focus_masks, hand_inputs
+            obj_pose = gt_metric_dense["object_pose_obj2cam"].clone()
+            obj_pose[..., :3, 3] = obj_pose[..., :3, 3] * scene_scale.view(-1, 1, 1)
+            gt["object_valid"] = gt_metric_dense["object_valid"]
+            gt["object_pose_obj2cam"] = obj_pose
+            gt["object_normalization_center"] = gt_metric_dense["object_normalization_center"]
+            object_scale_metric = gt_metric_dense["object_normalization_scale"]
+            if object_scale_metric.ndim == 1:
+                object_scale_metric = object_scale_metric.view(-1, 1, 1)
+            gt["object_normalization_scale"] = object_scale_metric * scene_scale.view(-1, 1, 1)
 
         return [pred, gt]
 
@@ -451,15 +394,17 @@ class Pi3XTrainer(BaseTrainer):
         if not self._vis_enabled():
             return
 
-        # For validation mode, check epoch interval. For training mode, caller controls timing.
+        views_batch = batch["views"] if self._has_views_sample(batch) else batch
+
+        # For validation mode, export the first batch every epoch.
         if mode == "test" and global_step is None:
-            if epoch % self._vis_interval() != 0:
+            if epoch >= 0 and epoch % self._vis_interval() != 0:
                 return
             if batch_idx != 0:
                 return
 
         pred, gt = forward_outputs
-        sample_index = min(self._vis_sample_index(), batch[0]["img"].shape[0] - 1)
+        sample_index = min(self._vis_sample_index(), views_batch[0]["img"].shape[0] - 1)
         if sample_index < 0:
             return
 
@@ -469,7 +414,7 @@ class Pi3XTrainer(BaseTrainer):
             log_prefix = "train_vis"
             log_step = global_step
         else:
-            tag = f"epoch_{epoch:04d}"
+            tag = "before_train" if epoch < 0 else f"epoch_{epoch:04d}"
             log_prefix = "val_vis"
             log_step = epoch
 
@@ -478,36 +423,12 @@ class Pi3XTrainer(BaseTrainer):
         output_path = output_root / f"sample_{sample_index:03d}.rrd"
         export_pi3x_rerun_sample(
             output_path=output_path,
-            batch=batch,
+            batch=views_batch,
             pred=pred,
             gt=gt,
             sample_index=sample_index,
             data_root=self._resolve_data_root(),
-            mano_layer=self.model.hand_mano_layer,
+            mano_layer=self._base_model.hand_mano_layer,
             item_name=self._vis_item_name(),
         )
-
-        first_view = batch[0]
-        rgb = PILImage.fromarray(vis_export._tensor_rgb_to_uint8(first_view["img"][sample_index]))
-        valid_mask = gt["valid_masks"][sample_index, 0]
-        pred_z = pred["local_points"][sample_index, 0, ..., 2]
-        gt_z = gt["local_points"][sample_index, 0, ..., 2]
-        pred_lo, pred_hi = vis_export._compute_depth_vis_range(pred_z, valid_mask)
-        pred_depth = PILImage.fromarray(vis_export._depth_to_uint8(pred_z, valid_mask, lo=pred_lo, hi=pred_hi))
-        gt_depth = PILImage.fromarray(vis_export._depth_to_uint8(gt_z, valid_mask, lo=pred_lo, hi=pred_hi))
-        depth_error = PILImage.fromarray(
-            vis_export._depth_to_uint8(
-                (pred_z - gt_z).abs(),
-                valid_mask,
-            )
-        )
-        self.log_all(
-            {
-                "rgb": rgb,
-                "pred_depth": pred_depth,
-                "gt_depth": gt_depth,
-                "depth_abs_error": depth_error,
-            },
-            step=log_step,
-            prefix=log_prefix,
-        )
+        del log_prefix, log_step

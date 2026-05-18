@@ -3,17 +3,19 @@
 trainer: trainers.pi3x_trainer.Pi3XTrainer
 
 train:
-  image_num_range: [6, 12]
-  max_img_per_gpu: 24
-  num_workers: 16
+  image_num_range: [11, 16]
+  max_img_per_gpu: 32
+  num_workers: 2
+  pin_memory: true
   batch_size: 1
-  num_epoch: 100
+  num_epoch: 50
   iters_per_epoch: -1
   print_freq: 40
   base_seed: 666
   model_dtype: bf16
+  debug_log_loss_details_every_iter: false
   dynamo_backend: NO
-  dynamic_compile: true
+  dynamic_compile: false
   gradient_accumulation_steps: 1
   clip_grad: 1.0
   clip_loss: 10
@@ -26,13 +28,15 @@ train:
   rank: -1
   gpu: -1
   dist_on_itp: false
-  find_unused_parameters: false
+  # Hand/object branches are data-dependent, so some ranks can legitimately
+  # skip hand parameters on a given step.
+  find_unused_parameters: true
   distributed: false
   dist_url: env://
   dist_backend: nccl
   optimizer:
     type: AdamW
-    lr: 5e-5
+    lr: 2e-5
     weight_decay: 5e-2
     betas: [0.9, 0.95]
     verbose: true
@@ -49,13 +53,15 @@ train:
 
 vis:
   enabled: true
-  interval: 1000
+  interval: 0
   sample_index: 0
   output_subdir: rerun
   item_name: pi3x_train_sample
 
 test:
-  num_workers: 16
+  image_num_range: [14, 14]
+  num_workers: 2
+  pin_memory: true
   batch_size: 1
   print_freq: 10
-  iters_per_test: -1
+  iters_per_test: 1

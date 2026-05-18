@@ -18,6 +18,7 @@ from pi3.visualization.pi3x_rerun_export import (
     _build_pred_object_mesh_vertices,
     _load_object_mesh_template,
     _transform_vertices,
+    convert_scene_gt_to_pred_scale,
     export_pi3x_rerun_sample,
 )
 
@@ -43,6 +44,20 @@ def _rotmat_to_rot6d(rotmat: torch.Tensor) -> torch.Tensor:
 
 def _tensor_to_float(value: torch.Tensor) -> float:
     return float(value.detach().cpu().item())
+
+
+def _to_jsonable(value):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() == 1:
+            return float(value.detach().cpu().item())
+        return value.detach().cpu().tolist()
+    if isinstance(value, dict):
+        return {k: _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    return value
 
 
 def build_reference_payloads(sample_batch, scene_gt, synthetic_depth_scale: float, data_root: str, mano_layer):
@@ -224,7 +239,7 @@ def run_selfcheck(sample_batch, scene_gt, pred_vis, pred_loss, gt_loss, data_roo
                     )
                     aligned_object_errors.append((pred_object - aligned_gt_object).abs().max().item())
 
-    loss = HandObjectLoss(mano_layer=mano_layer)
+    loss = HandObjectLoss()
     total_loss, details = loss(pred_loss, gt_loss)
 
     summary = {
@@ -232,14 +247,18 @@ def run_selfcheck(sample_batch, scene_gt, pred_vis, pred_loss, gt_loss, data_roo
         "hand_max_abs_err": max(aligned_hand_errors) if aligned_hand_errors else None,
         "object_max_abs_err": max(aligned_object_errors) if aligned_object_errors else None,
         "loss": float(total_loss.detach().cpu().item()),
-        "details": {k: None if v is None else float(v.detach().cpu().item()) for k, v in details.items()},
+        "details": _to_jsonable(details),
     }
     if output_rrd is not None:
+        scene_gt_vis = convert_scene_gt_to_pred_scale(
+            scene_gt,
+            torch.as_tensor([display_scale], dtype=torch.float32, device=scene_gt["local_points"].device),
+        )
         export_pi3x_rerun_sample(
             output_path=output_rrd,
             batch=sample_batch,
             pred=pred_vis,
-            gt=scene_gt,
+            gt=scene_gt_vis,
             sample_index=sample_index,
             data_root=data_root,
             mano_layer=mano_layer,
@@ -275,9 +294,12 @@ def main():
 
     mano_layer = None
     try:
-        from pi3.visualization.pi3x_rerun_export import _get_mano_layer
+        from pi3.visualization.pi3x_rerun_export import _build_visualization_mano_layer
 
-        mano_layer = _get_mano_layer("right")
+        mano_layer = {
+            "right": _build_visualization_mano_layer("right"),
+            "left": _build_visualization_mano_layer("left"),
+        }
     except Exception:
         pass
 

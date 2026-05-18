@@ -59,13 +59,18 @@ class HaMeRBackbone(nn.Module):
         self.output_dim = int(transformer_args["dim"])
         self.transformer = TransformerDecoder(**transformer_args)
 
+        self.decshape = nn.Linear(self.output_dim, 10)
+        nn.init.zeros_(self.decshape.weight)
+        nn.init.zeros_(self.decshape.bias)
+
+        mean_params = np.load(Path(cfg.MANO.MEAN_PARAMS))
+        init_betas = torch.from_numpy(mean_params["shape"].astype(np.float32)).unsqueeze(0)
+        self.register_buffer("init_betas", init_betas)
+
         if self.input_is_mean_shape:
-            mean_params = np.load(Path(cfg.MANO.MEAN_PARAMS))
             init_hand_pose = torch.from_numpy(mean_params["pose"].astype(np.float32)).unsqueeze(0)
-            init_betas = torch.from_numpy(mean_params["shape"].astype(np.float32)).unsqueeze(0)
             init_cam = torch.from_numpy(mean_params["cam"].astype(np.float32)).unsqueeze(0)
             self.register_buffer("init_hand_pose", init_hand_pose)
-            self.register_buffer("init_betas", init_betas)
             self.register_buffer("init_cam", init_cam)
 
     def _get_init_token(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -76,10 +81,12 @@ class HaMeRBackbone(nn.Module):
             return torch.cat([init_hand_pose, init_betas, init_cam], dim=1)[:, None, :].to(device=device, dtype=dtype)
         return torch.zeros(batch_size, 1, 1, device=device, dtype=dtype)
 
-    def forward(self, crops: torch.Tensor, hand_is_right: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, crops: torch.Tensor, hand_is_right: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         del hand_is_right
         feats = self.vit(crops)
         context = einops.rearrange(feats, "b c h w -> b (h w) c")
         token = self._get_init_token(crops.shape[0], crops.device, context.dtype)
         token_out = self.transformer(token, context=context)
-        return token_out.squeeze(1)
+        query = token_out.squeeze(1)
+        betas = self.decshape(query) + self.init_betas.expand(crops.shape[0], -1).to(device=query.device, dtype=query.dtype)
+        return query, betas

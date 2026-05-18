@@ -68,6 +68,22 @@ def write_square_rgb(path: Path, value: int, size: int = 224) -> None:
     Image.fromarray(rgb).save(path)
 
 
+def write_minimal_obj(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                "v 0.0 0.0 0.5",
+                "v 0.05 0.0 0.5",
+                "v 0.0 0.05 0.5",
+                "f 1 2 3",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def write_label(
     path: Path,
     *,
@@ -147,6 +163,7 @@ def build_fixture(root: Path) -> None:
     for model_name in ("011_banana", "019_pitcher_base"):
         multiview_dir = root / "models" / model_name / "canonical_views_224"
         multiview_dir.mkdir(parents=True, exist_ok=True)
+        write_minimal_obj(root / "models" / model_name / "textured_simple.obj")
         np.savez(
             multiview_dir / "camera_params.npz",
             K=intrinsics_mv,
@@ -228,9 +245,11 @@ def main() -> None:
         assert len(valid_dataset) == 2, len(valid_dataset)
 
         sample = train_dataset[0]
-        assert len(sample) == 3
+        assert set(sample.keys()) == {"views", "object_multiview_payload"}
+        assert len(sample["views"]) == 3
+        assert set(sample["object_multiview_payload"].keys()) == {"img", "depthmap", "camera_intrinsics", "camera_pose"}
 
-        for view in sample:
+        for view in sample["views"]:
             assert view["dataset"] == "DexYCB"
             assert view["img"].shape[0] == 3
             assert view["depthmap"].ndim == 2
@@ -245,16 +264,26 @@ def main() -> None:
             assert view["hand"]["mano_betas"].shape == (10,)
             assert view["hand"]["mano_side"] == "right"
             assert isinstance(bool(view["hand"]["valid"]), bool)
+            if view["hand"]["valid"]:
+                assert np.isfinite(view["hand"]["joints_2d"]).all()
             assert "object_multiview" in view
-            assert view["object_multiview"]["img"].shape == (8, 3, 224, 224)
-            assert view["object_multiview"]["depthmap"].shape == (8, 224, 224)
-            assert view["object_multiview"]["camera_intrinsics"].shape == (8, 3, 3)
-            assert view["object_multiview"]["camera_pose"].shape == (8, 4, 4)
-            assert view["object_multiview"]["pts3d"].shape == (8, 224, 224, 3)
-            assert view["object_multiview"]["grasped_object_id"] == 11
-            assert view["object_multiview"]["grasped_object_mask"].shape == view["depthmap"].shape
-            assert view["object_multiview"]["grasped_object_pose_obj2cam"].shape == (4, 4)
-            assert isinstance(bool(view["object_multiview"]["grasped_object_valid"]), bool)
+            assert "img" not in view["object_multiview"]
+            assert "depthmap" not in view["object_multiview"]
+            assert "camera_intrinsics" not in view["object_multiview"]
+            assert "camera_pose" not in view["object_multiview"]
+            assert "pts3d" not in view["object_multiview"]
+            assert view["object_multiview"]["template_vertices"].shape[1] == 3
+            assert view["object_multiview"]["normalization_center"].shape == (3,)
+            assert "grasped_object_id" not in view["object_multiview"]
+            assert "grasped_object_mask" not in view["object_multiview"]
+            assert "grasped_object_pose_obj2cam" not in view["object_multiview"]
+            assert "grasped_object_vertices_2d" not in view["object_multiview"]
+            assert "grasped_object_vertices_2d_valid" not in view["object_multiview"]
+            assert "grasped_object_valid" not in view["object_multiview"]
+            assert view["object"]["grasped_object_id"] == 11
+            assert view["object"]["mask"].shape == view["depthmap"].shape
+            assert view["object"]["pose_obj2cam"].shape == (4, 4)
+            assert isinstance(bool(view["object"]["valid"]), bool)
 
         loader = DataLoader(
             dataset=train_dataset,
@@ -264,17 +293,17 @@ def main() -> None:
             collate_fn=unified_collate_fn,
         )
         batch = next(iter(loader))
-        assert len(batch) == 3
-        assert batch[0]["img"].shape[0] == 2
-        assert batch[0]["hand"]["mask"].shape == (2, 224, 224)
-        assert batch[0]["hand"]["pose_mano"].shape == (2, 48)
-        assert batch[0]["hand"]["hand_transl"].shape == (2, 3)
-        assert batch[0]["hand"]["mano_side"] == ["right", "right"]
-        assert batch[0]["object_multiview"]["img"].shape == (2, 8, 3, 224, 224)
-        assert batch[0]["object_multiview"]["depthmap"].shape == (2, 8, 224, 224)
-        assert batch[0]["object_multiview"]["camera_intrinsics"].shape == (2, 8, 3, 3)
-        assert batch[0]["object_multiview"]["camera_pose"].shape == (2, 8, 4, 4)
-        assert batch[0]["object_multiview"]["grasped_object_mask"].shape == (2, 224, 224)
+        assert set(batch.keys()) == {"views", "object_multiview_payload"}
+        assert len(batch["views"]) == 3
+        assert batch["object_multiview_payload"]["img"].shape[0] == 2
+        assert "img" not in batch["views"][0]["object_multiview"]
+        assert "depthmap" not in batch["views"][0]["object_multiview"]
+        assert "camera_intrinsics" not in batch["views"][0]["object_multiview"]
+        assert "camera_pose" not in batch["views"][0]["object_multiview"]
+        assert "pts3d" not in batch["views"][0]["object_multiview"]
+        assert batch["views"][0]["object_multiview"]["template_vertices"].shape[0] == 2
+        assert "grasped_object_mask" not in batch["views"][0]["object_multiview"]
+        assert batch["views"][0]["object"]["mask"].shape == (2, 224, 224)
 
         print(json.dumps(
             {
@@ -284,6 +313,23 @@ def main() -> None:
             },
             indent=2,
         ))
+
+        payload_dataset = DexYCBDataset(
+            data_root=str(root),
+            mode="train",
+            resolution=[[224, 224]],
+            frame_num=3,
+            include_object_multiview_payload=True,
+        )
+        payload_sample = payload_dataset[0]
+        payload_mv = payload_sample["views"][0]["object_multiview"]
+        assert payload_mv["img"].shape == (8, 3, 224, 224)
+        assert payload_mv["depthmap"].shape == (8, 224, 224)
+        assert payload_mv["camera_intrinsics"].shape == (8, 3, 3)
+        assert payload_mv["camera_pose"].shape == (8, 4, 4)
+        assert payload_mv["pts3d"].shape == (8, 224, 224, 3)
+        train_mv = train_dataset.get_object_multiview_payload(11)
+        assert "pts3d" not in train_mv
 
 
 if __name__ == "__main__":

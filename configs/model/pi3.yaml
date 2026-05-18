@@ -48,6 +48,8 @@ train:
     rank: -1
     gpu: -1
     dist_on_itp: false
+    # Hand/object branches are data-dependent, so some ranks can legitimately
+    # skip hand parameters on a given step.
     find_unused_parameters: false
 
     # for distributed training

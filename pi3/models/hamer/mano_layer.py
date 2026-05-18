@@ -237,6 +237,27 @@ class ManoLayer(nn.Module):
 
         return torch.cat([global_orient.reshape(batch_size, -1), hand_pose], dim=1)
 
+    def decode_pose_coeffs_to_axis_angle(self, pose_coeffs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if pose_coeffs.dim() != 2:
+            raise ValueError("pose_coeffs must have shape (B, D)")
+        if pose_coeffs.shape[1] < self.rot + self.ncomps:
+            raise ValueError(
+                f"pose_coeffs must have at least {self.rot + self.ncomps} dims, got {pose_coeffs.shape[1]}"
+            )
+        global_orient = pose_coeffs[:, :3]
+        if self.use_pca:
+            hand_coeffs = pose_coeffs[:, self.rot : self.rot + self.ncomps]
+            full_hand_pose = self.th_hands_mean + hand_coeffs.mm(self.th_selected_comps)
+        else:
+            full_hand_pose = pose_coeffs[:, self.rot : self.rot + 45]
+        return global_orient.view(-1, 1, 3), full_hand_pose.view(-1, 15, 3)
+
+    def decode_pose_coeffs_to_rotmat(self, pose_coeffs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        global_orient_aa, hand_pose_aa = self.decode_pose_coeffs_to_axis_angle(pose_coeffs)
+        global_orient_rotmat = aa_to_rotmat(global_orient_aa.reshape(-1, 3)).view(-1, 1, 3, 3)
+        hand_pose_rotmat = aa_to_rotmat(hand_pose_aa.reshape(-1, 3)).view(-1, 15, 3, 3)
+        return global_orient_rotmat, hand_pose_rotmat
+
     def forward_axis_angle(
         self,
         global_orient: torch.Tensor,

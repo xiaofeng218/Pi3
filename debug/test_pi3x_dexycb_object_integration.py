@@ -36,13 +36,14 @@ from pi3.models.pi3x import Pi3X
 def _find_batch_with_valid_object(loader):
     for batch in loader:
         has_valid = False
-        for view in batch:
-            valid = view["object_multiview"]["grasped_object_valid"]
+        views = batch["views"] if isinstance(batch, dict) else batch
+        for view in views:
+            valid = view["object"]["valid"]
             if torch.is_tensor(valid) and bool(valid.any()):
                 has_valid = True
                 break
         if has_valid:
-            return batch
+            return views
     raise AssertionError("No DexYCB batch with valid object found")
 
 
@@ -56,7 +57,8 @@ class Pi3XDexYCBObjectIntegrationTests(unittest.TestCase):
                 data_root=str(root),
                 mode="train",
                 resolution=[[28, 28]],
-                frame_num=2,
+                frame_num=3,
+                include_object_multiview_payload=True,
                 shuffle=False,
                 seed=2024,
             )
@@ -75,19 +77,13 @@ class Pi3XDexYCBObjectIntegrationTests(unittest.TestCase):
                 "depthmap": batch[0]["object_multiview"]["depthmap"],
                 "camera_intrinsics": batch[0]["object_multiview"]["camera_intrinsics"],
                 "camera_pose": batch[0]["object_multiview"]["camera_pose"],
-                "grasped_object_mask": torch.stack(
-                    [view["object_multiview"]["grasped_object_mask"] for view in batch],
-                    dim=1,
-                ),
-                "grasped_object_valid": torch.stack(
-                    [view["object_multiview"]["grasped_object_valid"] for view in batch],
-                    dim=1,
-                ),
             }
+            object_masks = torch.stack([view["object"]["mask"] for view in batch], dim=1)
+            object_valid = torch.stack([view["object"]["valid"] for view in batch], dim=1)
 
             model = Pi3X(use_multimodal=False).eval()
             with torch.no_grad():
-                out = model(imgs, object_multiview=object_multiview)
+                out = model(imgs, object_masks=object_masks, object_valid=object_valid, object_multiview=object_multiview)
 
             self.assertIn("pred_object_rot6d", out)
             self.assertIn("pred_object_transl_dir", out)
@@ -104,7 +100,7 @@ class Pi3XDexYCBObjectIntegrationTests(unittest.TestCase):
             self.assertEqual(tuple(out["pred_object_trans"].shape), (1, len(batch), 3))
             self.assertEqual(tuple(out["pred_object_log_scale"].shape), (1, len(batch), 1))
             self.assertEqual(tuple(out["pred_object_scale"].shape), (1, len(batch), 1))
-            self.assertTrue(torch.equal(out["object_valid"], object_multiview["grasped_object_valid"]))
+            self.assertTrue(torch.equal(out["object_valid"], object_valid))
             self.assertTrue(bool(out["object_valid"].any()))
             self.assertTrue(torch.isfinite(out["pred_object_rot6d"]).all())
             self.assertTrue(torch.allclose(out["pred_object_trans"], out["pred_object_transl_dir"] * out["pred_object_transl_scale"]))

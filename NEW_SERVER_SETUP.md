@@ -102,7 +102,6 @@ echo "$DEXYCB_ROOT"          # data/dataset/dexycb
 
 ```bash
 conda activate pi3
-export PI3_DATA_ROOT=/data/pi3-assets   # 可选；不设置则默认使用 ./data
 source asset_registry/env.sh
 bash asset_registry/model/download_models.sh
 ```

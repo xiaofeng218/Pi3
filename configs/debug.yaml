@@ -4,50 +4,61 @@ defaults:
   - pi3x_hand_object
   - _self_
 
-name: pi3x_train_smoke_gpu
+name: pi3x_debug
 
-# Override dataset paths and parameters
+# Dataset: keep debug runs on a single fixed track with 3 frames per sample.
 train_dataset:
   data_root: ${oc.env:DEXYCB_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/dexycb}
-  frame_num: 1
+  frame_num: 3
+  max_tracks: 1
+  fix_epoch_seed: true
+  resolution:
+    - [224, 224]
 
+# Ignored when test.use_train_loader=true; kept mirrored for readability.
 test_dataset:
   data_root: ${oc.env:DEXYCB_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/dexycb}
-  frame_num: 1
+  mode: train
+  frame_num: 3
+  max_tracks: 1
+  fix_epoch_seed: true
+  resolution:
+    - [224, 224]
 
-# Override hand encoder paths
+# Hand encoder paths
 hand_encoder:
   config_file: ${oc.env:HAMER_CONFIG_FILE,configs/hamer/model_config.yaml}
   checkpoint: ${oc.env:HAMER_ENCODER_CKPT,null}
   cache_dir: ${oc.env:HAMER_CACHE_DIR,${oc.env:PI3_DATA_ROOT,data}/model/hamer/_DATA}
 
-# Override model paths and settings
+# Model paths
 model:
   ckpt: ${oc.env:PI3X_CKPT,null}
   encoder_pretrained: true
   hamer_config_file: ${oc.env:HAMER_CONFIG_FILE,configs/hamer/model_config.yaml}
   hamer_cache_dir: ${oc.env:HAMER_CACHE_DIR,${oc.env:PI3_DATA_ROOT,data}/model/hamer/_DATA}
 
-# Training parameters for quick debug
+# Training parameters for a minimal debug run.
 train:
+  image_num_range: [3, 3]
+  max_img_per_gpu: 3
   num_epoch: 1
   iters_per_epoch: 1
   batch_size: 1
   num_workers: 0
   print_freq: 1
-  dynamic_compile: false
-  dynamo_backend: NO
-  model_dtype: bf16
   auto_resume: false
   resume: null
 
-# Test parameters for quick debug
+# Test
 test:
+  use_train_loader: true
+  image_num_range: [3, 3]
   iters_per_test: 1
   batch_size: 1
   num_workers: 0
 
-# Logging and visualization
+# Logging
 log:
   ckpt_interval: 1
   max_checkpoints: 1
@@ -57,4 +68,4 @@ vis:
   interval: 1
   sample_index: 0
   output_subdir: rerun
-  item_name: pi3x_train_sample
+  item_name: pi3x_debug_sample

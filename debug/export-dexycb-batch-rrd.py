@@ -192,7 +192,7 @@ def export_dexycb_batch_rrd(
 
         rgb = _tensor_image_to_uint8(view["img"][sample_index])
         hand_mask = _mask_to_uint8(view["hand"]["mask"][sample_index])
-        object_mask = _mask_to_uint8(view["object_multiview"]["grasped_object_mask"][sample_index])
+        object_mask = _mask_to_uint8(view["object"]["mask"][sample_index])
         point_positions, point_colors = _pointcloud_from_view(view, sample_idx=sample_index)
 
         rr.log("frames/rgb", rr.Image(rgb))

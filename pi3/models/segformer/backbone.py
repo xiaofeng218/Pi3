@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from functools import partial
-from timm.models.layers import to_2tuple, trunc_normal_, DropPath
+from timm.layers import to_2tuple, trunc_normal_, DropPath
 
 class DWConv(nn.Module):
     def __init__(self, dim=768):

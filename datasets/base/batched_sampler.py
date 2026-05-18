@@ -117,6 +117,11 @@ class DynamicBatchSampler(Sampler):
         self.sampler = sampler
         self.resolution_num = resolution_num
         self.image_num_range = image_num_range
+        if image_num_range[1] > max_img_per_gpu:
+            raise ValueError(
+                "image_num_range upper bound exceeds max_img_per_gpu: "
+                f"{image_num_range[1]} > {max_img_per_gpu}"
+            )
         
         # Uniformly sample from the range of possible image numbers
         # For any image number, the weight is 1.0 (uniform sampling). You can set any different weights here.
@@ -138,6 +143,10 @@ class DynamicBatchSampler(Sampler):
         # Set the epoch for the sampler
         self.set_epoch(epoch + seed)
 
+    def _make_rngs(self):
+        rng_rank = np.random.default_rng(self.epoch * 100 + self.base_seed + self.rank)
+        rng = np.random.default_rng(self.epoch * 100 + self.base_seed)
+        return rng_rank, rng
 
     def set_epoch(self, epoch, base_seed=777):
         """
@@ -148,8 +157,7 @@ class DynamicBatchSampler(Sampler):
         """
         # self.sampler.set_epoch(epoch)
         self.epoch = epoch
-        self.rng_rank = np.random.default_rng(epoch * 100 + base_seed + self.rank)
-        self.rng = np.random.default_rng(epoch * 100 + base_seed)
+        self.base_seed = base_seed
 
     def __iter__(self):
         """
@@ -159,12 +167,13 @@ class DynamicBatchSampler(Sampler):
             Iterator yielding batches of indices with associated parameters.
         """
         sampler_iterator = iter(self.sampler)
+        rng_rank, rng = self._make_rngs()
 
         while True:
             try:
                 # Sample random image number and aspect ratio
-                random_image_num = int(self.rng.choice(self.possible_nums, p=self.normalized_weights))             # image number (batch size) should be the same (avoid one rank stop early)
-                resolution_idx = self.rng_rank.choice(self.resolution_num)                            # resolution can different between different rank
+                random_image_num = int(rng.choice(self.possible_nums, p=self.normalized_weights))             # image number (batch size) should be the same (avoid one rank stop early)
+                resolution_idx = rng_rank.choice(self.resolution_num)                            # resolution can different between different rank
 
                 # Update sampler parameters
                 self.sampler.update_parameters(
@@ -195,9 +204,17 @@ class DynamicBatchSampler(Sampler):
                 break  # End of sampler's iterator
 
     def __len__(self):
-        # Return a large dummy length
-        # return 1000000
-        return len(self.sampler) // self.image_num_range[0]            # dummy value because of dynamic batchsize
+        _, rng = self._make_rngs()
+        remaining = len(self.sampler)
+        batch_count = 0
+
+        while remaining > 0:
+            random_image_num = int(rng.choice(self.possible_nums, p=self.normalized_weights))
+            batch_size = max(1, int(np.floor(self.max_img_per_gpu / random_image_num)))
+            remaining -= batch_size
+            batch_count += 1
+
+        return batch_count
 
 
 class DynamicDistributedSampler(DistributedSampler):

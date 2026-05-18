@@ -237,7 +237,7 @@ class BaseDataset(EasyDataset):
                 views = self._get_views(idx, resolution, self._rng)
 
                 # assert len(views) == self.frame_num
-                if self.shuffle:
+                if False:  # self.shuffle — disabled for debugging object_multiview
                     self._rng.shuffle(views)
 
                 # check data-types
@@ -312,6 +312,8 @@ class BaseDataset(EasyDataset):
         if views is None:
             raise error
         
+        if hasattr(self, "_finalize_views_sample"):
+            return self._finalize_views_sample(views)
         return views
     
     def load_cache(self, cache_file):

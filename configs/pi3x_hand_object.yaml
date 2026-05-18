@@ -16,6 +16,9 @@ log:
   output_dir: ${oc.env:PI3X_OUTPUT_DIR,outputs/${name}}
   ckpt_dir: ${oc.env:PI3X_CKPT_DIR,outputs/${name}/ckpts}
 
+object:
+  vertex_sample_count: 2048
+
 hydra:
   run:
     dir: ${oc.env:PI3X_RUN_DIR,outputs/${name}}

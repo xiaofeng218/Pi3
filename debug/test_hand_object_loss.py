@@ -79,6 +79,39 @@ class _SideMANO(torch.nn.Module):
 
 
 class HandObjectLossTests(unittest.TestCase):
+    def test_loss_details_always_include_fixed_metric_keys(self) -> None:
+        loss = HandObjectLoss()
+        pred = {
+            "points": torch.zeros((1, 1, 1, 1, 3)),
+        }
+        targets = {
+            "scene_scale": torch.tensor([1.0]),
+        }
+
+        total, details = loss(pred, targets)
+
+        self.assertTrue(torch.isfinite(total))
+        expected = {
+            "hand_transl_loss",
+            "hand_full_scale_loss",
+            "hand_global_orient_loss",
+            "hand_pose_loss",
+            "hand_adversarial_prior_loss",
+            "hand_joints_3d_loss",
+            "hand_2d_loss",
+            "object_rot_loss",
+            "object_transl_loss",
+            "object_scale_loss",
+            "_weighted_loss_details",
+        }
+        self.assertTrue(expected.issubset(details.keys()))
+        for key in expected - {"_weighted_loss_details"}:
+            self.assertEqual(float(details[key]), 0.0)
+        self.assertEqual(
+            set(details["_weighted_loss_details"].keys()),
+            expected - {"_weighted_loss_details"},
+        )
+
     def test_estimate_scene_scale_from_depth_returns_pred_over_gt_ratio(self) -> None:
         gt_depth = torch.tensor([[[[1.0, 2.0], [4.0, 8.0]]]])
         pred_depth = gt_depth * 3.0
@@ -117,7 +150,6 @@ class HandObjectLossTests(unittest.TestCase):
         self.assertTrue(torch.allclose(details["hand_transl_scale_gt"], torch.tensor([[6.0]])))
         self.assertTrue(torch.allclose(details["hand_scale_gt"], torch.tensor([[3.0]])))
         self.assertAlmostEqual(float(details["hand_joints_3d_loss"]), 0.0, places=6)
-        self.assertAlmostEqual(float(details["hand_vertices_loss"]), 0.0, places=6)
 
     def test_hand_geometry_loss_uses_single_side_layer_without_legacy_fallback(self) -> None:
         loss = HandObjectLoss(mano_layer=_FakeMANO())
@@ -146,7 +178,6 @@ class HandObjectLossTests(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(total))
         self.assertAlmostEqual(float(details["hand_joints_3d_loss"]), 0.0, places=6)
-        self.assertAlmostEqual(float(details["hand_vertices_loss"]), 0.0, places=6)
 
     def test_hand_geometry_loss_uses_side_specific_gt_layer(self) -> None:
         loss = HandObjectLoss(
@@ -181,7 +212,6 @@ class HandObjectLossTests(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(total))
         self.assertAlmostEqual(float(details["hand_joints_3d_loss"]), 0.0, places=6)
-        self.assertAlmostEqual(float(details["hand_vertices_loss"]), 0.0, places=6)
 
     def test_object_losses_use_normalization_scale_and_scene_scale(self) -> None:
         loss = HandObjectLoss()

@@ -10,6 +10,7 @@ from .base.base_dataset import BaseDataset
 from .base.transforms import *
 import pi3.utils.cropping as cropping
 from pi3.utils.geometry import depthmap_to_absolute_camera_coordinates
+from pi3.utils.projection import load_obj_vertices, map_points_between_intrinsics
 
 
 _YCB_CLASSES = {
@@ -42,10 +43,14 @@ class DexYCBDataset(BaseDataset):
         self,
         data_root=None,
         split_style="s0_like_subject01",
-        subject="20200709-subject-01",
+        subject=None,
         local_window_radius=12,
         object_multiview_subdir="canonical_views_224",
+        include_object_multiview_payload=False,
         max_tracks=None,
+        vertex_sample_count=2048,
+        min_valid_ratio=None,
+        max_frame_gap=10,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -55,17 +60,39 @@ class DexYCBDataset(BaseDataset):
         self.data_root = data_root
         self.dataset_label = "DexYCB"
         self.split_style = split_style
-        self.subject = subject
+        self.vertex_sample_count = max(1, int(vertex_sample_count))
+        self.max_frame_gap = max_frame_gap
+        if subject is None or subject == "all":
+            data_path = Path(data_root)
+            discovered = []
+            for d in sorted(data_path.iterdir()):
+                if not d.is_dir() or not d.name.startswith("2020"):
+                    continue
+                children = list(d.iterdir())
+                if any(cd.is_dir() and (cd / "meta.yml").exists() for cd in children):
+                    discovered.append(d.name)
+            if discovered:
+                subject = discovered
+            else:
+                subject = ["20200709-subject-01"]
+        if isinstance(subject, str):
+            subject = [subject]
+        self.subjects = list(subject)
         self.local_window_radius = local_window_radius
         self.object_multiview_subdir = object_multiview_subdir
+        self.include_object_multiview_payload = bool(include_object_multiview_payload)
         self.max_tracks = max_tracks
 
+        self.min_valid_ratio = min_valid_ratio
+
+        # 缓存公用数据（内外参、beta、物体）
         self.intrinsics_cache = self._load_intrinsics_cache()
         self.extrinsics_cache = {}
         self.mano_cache = {}
         self.sequence_meta_cache = {}
         self.object_multiview_cache = {}
         self.object_model_index = self._build_object_model_index()
+        self.object_vertices_cache = {}
 
         self.tracks = self._build_tracks()
         self.sequences = self.tracks
@@ -78,6 +105,26 @@ class DexYCBDataset(BaseDataset):
     def _load_yaml(self, path):
         with open(path, "r", encoding="utf-8") as f:
             return yaml.load(f, Loader=yaml.FullLoader)
+
+    def _load_camera_params(self, path):
+        with np.load(path, allow_pickle=False) as camera_params:
+            intrinsics = camera_params["K"].astype(np.float32)
+            camera_pose = camera_params["T_oc"].astype(np.float32)
+            normalization_center = camera_params["normalization_center"].astype(np.float32)
+            normalization_scale = np.float32(camera_params["normalization_scale"])
+        return intrinsics, camera_pose, normalization_center, normalization_scale
+
+    def _load_rgb_array(self, path):
+        with Image.open(path) as image:
+            return np.array(image.convert("RGB"))
+
+    def _load_rgb_pil(self, path):
+        with Image.open(path) as image:
+            return image.convert("RGB").copy()
+
+    def _load_label_npz(self, path):
+        with np.load(path, allow_pickle=False) as label:
+            return {key: label[key] for key in label.files}
 
     def _mode_to_split(self):
         return "train" if self.mode == "train" else "valid"
@@ -127,6 +174,20 @@ class DexYCBDataset(BaseDataset):
         self.extrinsics_cache[extrinsics_id] = cache
         return cache
 
+    def _load_object_template_vertices(self, object_id):
+        object_id = int(object_id)
+        if object_id in self.object_vertices_cache:
+            return self.object_vertices_cache[object_id]
+
+        model_dir = self.object_model_index.get(object_id)
+        if model_dir is None:
+            raise KeyError(f"Missing model directory for DexYCB object id {object_id}")
+
+        obj_path = model_dir / "textured_simple.obj"
+        vertices = load_obj_vertices(obj_path)
+        self.object_vertices_cache[object_id] = vertices
+        return vertices
+
     def _load_mano_betas(self, mano_calib):
         if mano_calib in self.mano_cache:
             return self.mano_cache[mano_calib]
@@ -144,8 +205,8 @@ class DexYCBDataset(BaseDataset):
         self.mano_cache[mano_calib] = betas
         return betas
 
-    def _list_sequences(self):
-        subject_root = Path(self.data_root) / self.subject
+    def _list_sequences(self, subject):
+        subject_root = Path(self.data_root) / subject
         assert subject_root.is_dir(), f"Missing DexYCB subject directory: {subject_root}"
         return sorted(
             path.name
@@ -163,45 +224,46 @@ class DexYCBDataset(BaseDataset):
 
     def _build_tracks(self):
         tracks = []
-        subject_root = Path(self.data_root) / self.subject
-        sequences = self._list_sequences()
-        for sequence_idx, sequence in enumerate(sequences):
-            if not self._sequence_in_split(sequence_idx):
-                continue
+        for subject in self.subjects:
+            subject_root = Path(self.data_root) / subject
+            sequences = self._list_sequences(subject)
+            for sequence_idx, sequence in enumerate(sequences):
+                if not self._sequence_in_split(sequence_idx):
+                    continue
 
-            meta_path = subject_root / sequence / "meta.yml"
-            meta = self._load_yaml(meta_path)
-            self.sequence_meta_cache[f"{self.subject}/{sequence}"] = meta
+                meta_path = subject_root / sequence / "meta.yml"
+                meta = self._load_yaml(meta_path)
+                self.sequence_meta_cache[f"{subject}/{sequence}"] = meta
 
-            serials = meta["serials"]
-            num_frames = int(meta["num_frames"])
-            extrinsics_id = meta["extrinsics"]
-            mano_calib = meta["mano_calib"][0]
-            mano_side = meta["mano_sides"][0]
-            ycb_ids = meta["ycb_ids"]
-            ycb_grasp_ind = int(meta["ycb_grasp_ind"])
-            grasped_object_id = int(ycb_ids[ycb_grasp_ind])
-            grasped_object_local_index = ycb_grasp_ind
+                serials = meta["serials"]
+                num_frames = int(meta["num_frames"])
+                extrinsics_id = meta["extrinsics"]
+                mano_calib = meta["mano_calib"][0]
+                mano_side = meta["mano_sides"][0]
+                ycb_ids = meta["ycb_ids"]
+                ycb_grasp_ind = int(meta["ycb_grasp_ind"])
+                grasped_object_id = int(ycb_ids[ycb_grasp_ind])
+                grasped_object_local_index = ycb_grasp_ind
 
-            self._load_extrinsics(extrinsics_id)
-            self._load_mano_betas(mano_calib)
+                self._load_extrinsics(extrinsics_id)
+                self._load_mano_betas(mano_calib)
 
-            for serial in serials:
-                tracks.append(
-                    {
-                        "subject": self.subject,
-                        "sequence": sequence,
-                        "camera": serial,
-                        "split": self._mode_to_split(),
-                        "sequence_idx": sequence_idx,
-                        "num_frames": num_frames,
-                        "extrinsics_id": extrinsics_id,
-                        "mano_calib": mano_calib,
-                        "mano_side": mano_side,
-                        "grasped_object_id": grasped_object_id,
-                        "grasped_object_local_index": grasped_object_local_index,
-                    }
-                )
+                for serial in serials:
+                    tracks.append(
+                        {
+                            "subject": subject,
+                            "sequence": sequence,
+                            "camera": serial,
+                            "split": self._mode_to_split(),
+                            "sequence_idx": sequence_idx,
+                            "num_frames": num_frames,
+                            "extrinsics_id": extrinsics_id,
+                            "mano_calib": mano_calib,
+                            "mano_side": mano_side,
+                            "grasped_object_id": grasped_object_id,
+                            "grasped_object_local_index": grasped_object_local_index,
+                        }
+                    )
 
         if self.max_tracks is not None and len(tracks) > self.max_tracks:
             tracks = tracks[: self.max_tracks]
@@ -214,13 +276,12 @@ class DexYCBDataset(BaseDataset):
             should_replace = num_frames < self.frame_num
             return list(rng.choice(np.arange(num_frames), size=self.frame_num, replace=should_replace))
 
-        max_gap = 10
         gap = (num_frames - 1) / (self.frame_num - 1) if self.frame_num > 1 else 0
-        if gap <= max_gap:
+        if gap <= self.max_frame_gap:
             indices = np.linspace(0, num_frames - 1, self.frame_num, dtype=int)
             return list(indices)
 
-        window_span = (self.frame_num - 1) * max_gap
+        window_span = (self.frame_num - 1) * self.max_frame_gap
         if window_span >= num_frames:
             indices = np.linspace(0, num_frames - 1, self.frame_num, dtype=int)
         else:
@@ -250,11 +311,9 @@ class DexYCBDataset(BaseDataset):
         if not bundle_dir.is_dir():
             raise FileNotFoundError(f"Missing object multiview bundle: {bundle_dir}")
 
-        camera_params = np.load(bundle_dir / "camera_params.npz", allow_pickle=False)
-        intrinsics = camera_params["K"].astype(np.float32)
-        camera_pose = camera_params["T_oc"].astype(np.float32)
-        normalization_center = camera_params["normalization_center"].astype(np.float32)
-        normalization_scale = np.float32(camera_params["normalization_scale"])
+        intrinsics, camera_pose, normalization_center, normalization_scale = self._load_camera_params(
+            bundle_dir / "camera_params.npz"
+        )
 
         view_count = intrinsics.shape[0]
         color_files = [bundle_dir / f"color_{view_idx:06d}.jpg" for view_idx in range(view_count)]
@@ -278,14 +337,23 @@ class DexYCBDataset(BaseDataset):
         self.object_multiview_cache[object_id] = bundle
         return bundle
 
-    def _prepare_object_multiview(self, object_id):
+    @staticmethod
+    def _subsample_vertices(vertices: np.ndarray, target_count: int) -> np.ndarray:
+        """Uniformly subsample vertices along the first axis to target_count."""
+        num = vertices.shape[0]
+        if num == target_count:
+            return vertices.copy()
+        indices = np.linspace(0, num - 1, target_count).round().astype(int)
+        return vertices[indices]
+
+    def _prepare_object_multiview(self, object_id, include_pts3d=True):
         bundle = self._load_object_multiview_bundle(object_id)
         if bundle is None:
             return None
 
         imgs = []
         depthmaps = []
-        pts3d_all = []
+        pts3d_all = [] if include_pts3d else None
 
         for color_file, depth_file, intrinsics, camera_pose in zip(
             bundle["color_files"],
@@ -293,29 +361,48 @@ class DexYCBDataset(BaseDataset):
             bundle["camera_intrinsics"],
             bundle["camera_pose"],
         ):
-            image = Image.open(color_file).convert("RGB")
+            image = self._load_rgb_pil(color_file)
             imgs.append(self.transform(image))
 
             depthmap = cv2.imread(str(depth_file), cv2.IMREAD_ANYDEPTH).astype(np.float32) / 1000.0
-            pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(
-                depthmap=depthmap,
-                camera_intrinsics=intrinsics,
-                camera_pose=camera_pose,
-                z_far=self.z_far,
-            )
-            depthmap[~valid_mask] = 0.0
+            if include_pts3d:
+                pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(
+                    depthmap=depthmap,
+                    camera_intrinsics=intrinsics,
+                    camera_pose=camera_pose,
+                    z_far=self.z_far,
+                )
+                depthmap[~valid_mask] = 0.0
+                pts3d_all.append(pts3d.astype(np.float32))
             depthmaps.append(depthmap.astype(np.float32))
-            pts3d_all.append(pts3d.astype(np.float32))
-
-        return {
+        template_verts = self._load_object_template_vertices(object_id)
+        template_verts = self._subsample_vertices(template_verts, self.vertex_sample_count)
+        payload = {
             "img": torch.stack(imgs, dim=0),
             "depthmap": np.stack(depthmaps, axis=0).astype(np.float32),
             "camera_intrinsics": bundle["camera_intrinsics"].copy(),
             "camera_pose": bundle["camera_pose"].copy(),
-            "pts3d": np.stack(pts3d_all, axis=0).astype(np.float32),
+            "template_vertices": template_verts,
             "normalization_center": bundle["normalization_center"].copy(),
             "normalization_scale": np.float32(bundle["normalization_scale"]),
         }
+        if include_pts3d:
+            payload["pts3d"] = np.stack(pts3d_all, axis=0).astype(np.float32)
+        return payload
+
+    def get_object_multiview_payload(self, object_id, include_pts3d=False):
+        payload = self._prepare_object_multiview(object_id, include_pts3d=include_pts3d)
+        if payload is None:
+            return None
+        result = {
+            "img": payload["img"],
+            "depthmap": payload["depthmap"],
+            "camera_intrinsics": payload["camera_intrinsics"],
+            "camera_pose": payload["camera_pose"],
+        }
+        if include_pts3d and "pts3d" in payload:
+            result["pts3d"] = payload["pts3d"]
+        return result
 
     def _build_hand_payload(self, hand_mask, hand_valid, pose_m, joint_3d, joint_2d, mano_betas, mano_side):
         return {
@@ -329,24 +416,113 @@ class DexYCBDataset(BaseDataset):
             "mano_side": mano_side,
         }
 
-    def _build_object_multiview_payload(
+    def _build_object_payload(
         self,
-        base_object_multiview,
-        grasped_object_id,
-        grasped_object_mask,
-        grasped_object_valid,
-        grasped_object_pose_obj2cam,
+        object_id,
+        object_mask,
+        object_valid,
+        object_pose,
     ):
-        payload = {} if base_object_multiview is None else dict(base_object_multiview)
-        payload.update(
-            {
-                "grasped_object_id": np.int32(grasped_object_id),
-                "grasped_object_mask": grasped_object_mask,
-                "grasped_object_valid": grasped_object_valid,
-                "grasped_object_pose_obj2cam": grasped_object_pose_obj2cam.astype(np.float32),
-            }
+        return {
+            "grasped_object_id": np.int32(object_id),
+            "mask": object_mask.astype(bool),
+            "valid": bool(object_valid),
+            "pose_obj2cam": object_pose.astype(np.float32),
+        }
+
+    def _build_scene_inputs(self, views):
+        imgs = torch.stack([view["img"] for view in views], dim=0)
+        depths = torch.stack([torch.as_tensor(view["depthmap"]).float() for view in views], dim=0)
+        intrinsics = torch.stack([torch.as_tensor(view["camera_intrinsics"]).float() for view in views], dim=0)
+        poses = torch.stack([torch.as_tensor(view["camera_pose"]).float() for view in views], dim=0)
+
+        hand_masks = torch.stack([torch.as_tensor(view["hand"]["mask"]).float() for view in views], dim=0)
+        hand_owner_index = torch.tensor([[0, view_idx, 0] for view_idx in range(len(views))], dtype=torch.long)
+        hand_is_right = torch.tensor(
+            [view["hand"]["mano_side"] == "right" for view in views],
+            dtype=torch.bool,
         )
-        return payload
+
+        object_masks = torch.stack([torch.as_tensor(view["object"]["mask"]).bool() for view in views], dim=0)
+        object_valid = torch.tensor([bool(view["object"]["valid"]) for view in views], dtype=torch.bool)
+
+        object_id = int(views[0]["object"]["grasped_object_id"])
+        object_multiview_payload = self.get_object_multiview_payload(object_id)
+        object_multiview = None
+        if object_multiview_payload is not None:
+            object_multiview = {
+                "img": object_multiview_payload["img"],
+                "depthmap": torch.as_tensor(object_multiview_payload["depthmap"]).float(),
+                "camera_intrinsics": torch.as_tensor(object_multiview_payload["camera_intrinsics"]).float(),
+                "camera_pose": torch.as_tensor(object_multiview_payload["camera_pose"]).float(),
+            }
+
+        return {
+            "imgs": imgs,
+            "depths": depths,
+            "intrinsics": intrinsics,
+            "poses": poses,
+            "hand_masks": hand_masks,
+            "hand_owner_index": hand_owner_index,
+            "hand_is_right": hand_is_right,
+            "object_masks": object_masks,
+            "object_valid": object_valid,
+            "object_multiview": object_multiview,
+        }
+
+    def _build_gt_metric(self, views):
+        hand_valid = torch.tensor([bool(view["hand"]["valid"]) for view in views], dtype=torch.bool)
+        hand_pose_coeffs = torch.stack([torch.as_tensor(view["hand"]["pose_mano"]).float() for view in views], dim=0)
+        hand_transl = torch.stack([torch.as_tensor(view["hand"]["hand_transl"]).float() for view in views], dim=0)
+        hand_mano_betas = torch.stack([torch.as_tensor(view["hand"]["mano_betas"]).float() for view in views], dim=0)
+        hand_joints_3d = torch.stack([torch.as_tensor(view["hand"]["joints_3d_cam"]).float() for view in views], dim=0)
+        hand_joints_2d = torch.stack([torch.as_tensor(view["hand"]["joints_2d"]).float() for view in views], dim=0)
+        hand_camera_intrinsics = torch.stack([torch.as_tensor(view["camera_intrinsics"]).float() for view in views], dim=0)
+        hand_is_right = torch.tensor([view["hand"]["mano_side"] == "right" for view in views], dtype=torch.bool)
+        hand_owner_index = torch.tensor([[0, view_idx, 0] for view_idx in range(len(views))], dtype=torch.long)
+
+        object_valid = torch.tensor([bool(view["object"]["valid"]) for view in views], dtype=torch.bool)
+        object_pose_obj2cam = torch.stack([torch.as_tensor(view["object"]["pose_obj2cam"]).float() for view in views], dim=0)
+        object_camera_intrinsics = torch.stack([torch.as_tensor(view["camera_intrinsics"]).float() for view in views], dim=0)
+
+        object_multiview_shared = views[0]["object_multiview"]
+        return {
+            "hand_valid": hand_valid,
+            "hand_pose_coeffs": hand_pose_coeffs,
+            "hand_transl": hand_transl,
+            "hand_mano_betas": hand_mano_betas,
+            "hand_joints_3d": hand_joints_3d,
+            "hand_joints_2d": hand_joints_2d,
+            "hand_camera_intrinsics": hand_camera_intrinsics,
+            "hand_is_right": hand_is_right,
+            "hand_owner_index": hand_owner_index,
+            "object_valid": object_valid,
+            "object_pose_obj2cam": object_pose_obj2cam,
+            "object_camera_intrinsics": object_camera_intrinsics,
+            "object_template_vertices": torch.as_tensor(object_multiview_shared["template_vertices"]).float(),
+            "object_normalization_center": torch.as_tensor(object_multiview_shared["normalization_center"]).float(),
+            "object_normalization_scale": torch.as_tensor(object_multiview_shared["normalization_scale"]).float(),
+        }
+
+    def _build_gt_scale_meta(self, views):
+        scene_focus_masks = torch.stack(
+            [
+                torch.as_tensor(view["hand"]["mask"]).bool() | torch.as_tensor(view["object"]["mask"]).bool()
+                for view in views
+            ],
+            dim=0,
+        )
+        return {
+            "scene_focus_masks": scene_focus_masks,
+        }
+
+    def _finalize_views_sample(self, views):
+        object_id = int(views[0]["object"]["grasped_object_id"])
+        object_multiview_payload = self.get_object_multiview_payload(object_id)
+        return {
+            "views": views,
+            "object_multiview_payload": object_multiview_payload or {},
+        }
 
     def _crop_resize_with_masks(self, image, depthmap, intrinsics, resolution, rng=None, info=None, masks=None):
         if masks is None:
@@ -442,14 +618,14 @@ class DexYCBDataset(BaseDataset):
         base_object_multiview = self._prepare_object_multiview(track["grasped_object_id"])
 
         views = []
-        for frame_idx in frame_indices:
+        for view_idx, frame_idx in enumerate(frame_indices):
             rgb_path = subject_root / f"color_{frame_idx:06d}.jpg"
             depth_path = subject_root / f"aligned_depth_to_color_{frame_idx:06d}.png"
             label_path = subject_root / f"labels_{frame_idx:06d}.npz"
 
-            rgb_image = np.array(Image.open(rgb_path))
+            rgb_image = self._load_rgb_array(rgb_path)
             depthmap = cv2.imread(str(depth_path), cv2.IMREAD_ANYDEPTH).astype(np.float32) / 1000.0
-            label = np.load(label_path)
+            label = self._load_label_npz(label_path)
             seg = label["seg"]
 
             pose_m = label["pose_m"][0].astype(np.float32)
@@ -481,9 +657,39 @@ class DexYCBDataset(BaseDataset):
 
             hand_mask = masks["hand_mask"]
             grasped_object_mask = masks["grasped_object_mask"]
+            joint_2d_processed = map_points_between_intrinsics(joint_2d, base_intrinsics, intrinsics)
 
             hand_valid = bool(hand_mask.any()) and bool(np.any(pose_m != 0.0)) and bool(np.any(joint_3d != -1.0))
             grasped_object_valid = bool(grasped_object_mask.any()) and bool(object_pose_valid)
+            # Shared fields: tiny ones (~25KB) are cheap to include in every view;
+            # heavy fields (img/depthmap/pts3d, ~56MB total) only in view 0.
+            # NB: views are shuffled after _get_views, so consumers must search
+            # for the first view that has "img" rather than using a fixed index.
+            if base_object_multiview is not None:
+                object_multiview = {
+                    "template_vertices": base_object_multiview["template_vertices"],
+                    "normalization_center": base_object_multiview["normalization_center"],
+                    "normalization_scale": base_object_multiview["normalization_scale"],
+                }
+                if self.include_object_multiview_payload and view_idx == 0:
+                    object_multiview.update(
+                        {
+                            "img": base_object_multiview["img"],
+                            "depthmap": base_object_multiview["depthmap"],
+                            "camera_intrinsics": base_object_multiview["camera_intrinsics"],
+                            "camera_pose": base_object_multiview["camera_pose"],
+                            "pts3d": base_object_multiview["pts3d"],
+                        }
+                    )
+            else:
+                object_multiview = {}
+
+            object_payload = self._build_object_payload(
+                object_id=track["grasped_object_id"],
+                object_mask=grasped_object_mask,
+                object_valid=grasped_object_valid,
+                object_pose=object_pose,
+            )
 
             views.append(
                 dict(
@@ -500,18 +706,24 @@ class DexYCBDataset(BaseDataset):
                         hand_valid=hand_valid,
                         pose_m=pose_m,
                         joint_3d=joint_3d,
-                        joint_2d=joint_2d,
+                        joint_2d=joint_2d_processed,
                         mano_betas=mano_betas,
                         mano_side=track["mano_side"],
                     ),
-                    object_multiview=self._build_object_multiview_payload(
-                        base_object_multiview=base_object_multiview,
-                        grasped_object_id=track["grasped_object_id"],
-                        grasped_object_mask=grasped_object_mask,
-                        grasped_object_valid=grasped_object_valid,
-                        grasped_object_pose_obj2cam=object_pose,
-                    ),
+                    object=object_payload,
+                    object_multiview=object_multiview,
                 )
             )
+
+        if self.min_valid_ratio is not None:
+            valid_count = sum(
+                1 for v in views
+                if v["hand"]["valid"] or v["object"]["valid"]
+            )
+            if valid_count / len(views) < self.min_valid_ratio:
+                raise ValueError(
+                    f"Sample has {valid_count}/{len(views)} valid frames "
+                    f"(min_valid_ratio={self.min_valid_ratio})"
+                )
 
         return views

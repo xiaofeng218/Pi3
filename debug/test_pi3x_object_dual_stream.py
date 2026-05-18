@@ -88,13 +88,9 @@ class _SpyObjectPoseHead(nn.Module):
             "scale": torch.exp(summary),
         }
 
-def _build_object_multiview(canonical_imgs: torch.Tensor) -> dict[str, torch.Tensor]:
-    return {
-        "img": canonical_imgs,
-        "depthmap": torch.zeros(1, 8, 8, 8),
-        "camera_intrinsics": torch.eye(3).view(1, 1, 3, 3).repeat(1, 8, 1, 1),
-        "camera_pose": torch.eye(4).view(1, 1, 4, 4).repeat(1, 8, 1, 1),
-        "grasped_object_mask": torch.tensor(
+def _build_object_inputs() -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.tensor(
             [
                 [
                     [
@@ -112,11 +108,37 @@ def _build_object_multiview(canonical_imgs: torch.Tensor) -> dict[str, torch.Ten
             ],
             dtype=torch.float32,
         ).reshape(1, 2, 8, 8),
-        "grasped_object_valid": torch.tensor([[True, False]], dtype=torch.bool),
+        torch.tensor([[True, False]], dtype=torch.bool),
+    )
+
+
+def _build_object_multiview(canonical_imgs: torch.Tensor) -> dict[str, torch.Tensor]:
+    return {
+        "img": canonical_imgs,
+        "depthmap": torch.zeros(1, 8, 8, 8),
+        "camera_intrinsics": torch.eye(3).view(1, 1, 3, 3).repeat(1, 8, 1, 1),
+        "camera_pose": torch.eye(4).view(1, 1, 4, 4).repeat(1, 8, 1, 1),
     }
 
 
 class Pi3XObjectDualStreamTests(unittest.TestCase):
+    def test_forward_requires_object_masks_and_object_valid_with_object_multiview(self) -> None:
+        model = Pi3X(use_multimodal=False).eval()
+        imgs = torch.rand(1, 2, 3, 8, 8)
+        object_multiview = _build_object_multiview(torch.full((1, 8, 3, 8, 8), 0.2))
+
+        with self.assertRaisesRegex(ValueError, "object_masks and object_valid are required"):
+            model(imgs, object_multiview=object_multiview)
+
+    def test_forward_does_not_fallback_to_legacy_grasped_object_fields(self) -> None:
+        model = Pi3X(use_multimodal=False).eval()
+        imgs = torch.rand(1, 2, 3, 8, 8)
+        object_multiview = _build_object_multiview(torch.full((1, 8, 3, 8, 8), 0.2))
+        object_multiview["grasped_object_mask"], object_multiview["grasped_object_valid"] = _build_object_inputs()
+
+        with self.assertRaisesRegex(ValueError, "object_masks and object_valid are required"):
+            model(imgs, object_multiview=object_multiview)
+
     def test_forward_object_predictions_depend_on_canonical_stream_and_preserve_invalid_view_routing(self) -> None:
         model = Pi3X(use_multimodal=False).eval()
         encoder = _SpyEncoder(token_dim=model.dec_embed_dim, patch_tokens=4)
@@ -136,21 +158,22 @@ class Pi3XObjectDualStreamTests(unittest.TestCase):
         canonical_imgs_b = torch.full((1, 8, 3, 8, 8), 0.8)
         object_multiview_a = _build_object_multiview(canonical_imgs_a)
         object_multiview_b = _build_object_multiview(canonical_imgs_b)
+        object_masks, object_valid = _build_object_inputs()
 
-        out_a = model(imgs, object_multiview=object_multiview_a)
-        out_b = model(imgs, object_multiview=object_multiview_b)
+        out_a = model(imgs, object_masks=object_masks, object_valid=object_valid, object_multiview=object_multiview_a)
+        out_b = model(imgs, object_masks=object_masks, object_valid=object_valid, object_multiview=object_multiview_b)
 
         self.assertEqual(len(object_query_adapter.calls), 2)
         self.assertTrue(
             torch.equal(
                 object_query_adapter.calls[0]["grasped_object_valid"],
-                object_multiview_a["grasped_object_valid"],
+                object_valid,
             )
         )
         self.assertTrue(
             torch.equal(
                 object_query_adapter.calls[1]["grasped_object_valid"],
-                object_multiview_b["grasped_object_valid"],
+                object_valid,
             )
         )
         self.assertEqual(object_query_adapter.calls[0]["image_hw"], (8, 8))

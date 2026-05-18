@@ -6,20 +6,24 @@ defaults:
 
 name: pi3x_overfit
 
-# Dataset: only 1 track, 12 frames per sample
+# Dataset: overfit on a single fixed track with 3 frames per sample.
 train_dataset:
   data_root: ${oc.env:DEXYCB_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/dexycb}
-  frame_num: 6
+  frame_num: 3
   max_tracks: 1
   fix_epoch_seed: true
+  resolution:
+    - [224, 224]
 
 # Ignored when test.use_train_loader=true; kept mirrored for readability.
 test_dataset:
   data_root: ${oc.env:DEXYCB_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/dexycb}
   mode: train
-  frame_num: 6
+  frame_num: 3
   max_tracks: 1
   fix_epoch_seed: true
+  resolution:
+    - [224, 224]
 
 # Hand encoder paths
 hand_encoder:
@@ -36,14 +40,13 @@ model:
 
 # Training parameters for overfitting
 train:
-  num_epoch: 5
+  image_num_range: [3, 3]
+  max_img_per_gpu: 3
+  num_epoch: 10
   iters_per_epoch: 100
   batch_size: 1
   num_workers: 0
   print_freq: 10
-  dynamic_compile: false
-  dynamo_backend: NO
-  model_dtype: bf16
   auto_resume: false
   resume: null
   optimizer:
@@ -52,6 +55,7 @@ train:
 # Test
 test:
   use_train_loader: true
+  image_num_range: [3, 3]
   iters_per_test: 1
   batch_size: 1
   num_workers: 0
@@ -59,11 +63,11 @@ test:
 # Logging
 log:
   ckpt_interval: 100
-  max_checkpoints: 5
+  max_checkpoints: 100
 
 vis:
   enabled: true
-  interval: 100
+  interval: 5
   sample_index: 0
   output_subdir: rerun
   item_name: pi3x_overfit_sample

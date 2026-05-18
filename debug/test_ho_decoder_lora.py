@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+import yaml
 import torch
 
 from pi3.models.layers.attention import FlashAttentionRope, FlashCrossAttentionRope
@@ -9,6 +10,15 @@ from pi3.models.layers.block import HOBlockRope
 
 
 class HODecoderLoRATests(unittest.TestCase):
+    def test_pi3x_hand_object_config_targets_all_ho_linear_groups(self) -> None:
+        with open("configs/model/pi3x_hand_object.yaml", "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+
+        self.assertEqual(
+            cfg["ho_lora_cfg"]["targets"],
+            ["cross_attn", "self_attn", "mlp"],
+        )
+
     def test_ho_block_accepts_lora_cfg_and_keeps_output_shape(self) -> None:
         blk = HOBlockRope(
             dim=64,

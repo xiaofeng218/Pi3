@@ -6,17 +6,24 @@ train_dataset:
   split_style: s0_like_subject01
   subject: 20200709-subject-01
   object_multiview_subdir: canonical_views_224
+  include_object_multiview_payload: false
   use_crop: false
   mode: train
   z_far: 0
   frame_num: 8
+  vertex_sample_count: ${object.vertex_sample_count}
+  min_valid_ratio: null
+  max_frame_gap: 5
   resolution:
-    - [224, 224]
+    - [504, 504]
   shuffle: true
 
 train_dataloader:
   drop_last: true
   shuffle: true
+  persistent_workers: false
+  multiprocessing_context: null
+  prefetch_factor: 1
 
 test_dataset:
   _target_: datasets.dexycb_dataset.DexYCBDataset
@@ -24,14 +31,21 @@ test_dataset:
   split_style: s0_like_subject01
   subject: 20200709-subject-01
   object_multiview_subdir: canonical_views_224
+  include_object_multiview_payload: false
   use_crop: false
   mode: test
   z_far: 0
   frame_num: 8
+  vertex_sample_count: ${object.vertex_sample_count}
+  min_valid_ratio: null
+  max_frame_gap: 5
   resolution:
-    - [224, 224]
+    - [504, 504]
   shuffle: false
 
 test_dataloader:
   drop_last: false
   shuffle: false
+  persistent_workers: false
+  multiprocessing_context: null
+  prefetch_factor: 1

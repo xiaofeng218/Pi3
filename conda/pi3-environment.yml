@@ -3,6 +3,10 @@ channels:
   - defaults
   - conda-forge
 dependencies:
+  - python=3.10
+  - pip
+  - setuptools<70
+  - wheel
   - _libgcc_mutex=0.1=main
   - _openmp_mutex=5.1=1_gnu
   - antlr-python-runtime=4.9.3=pyhd8ed1ab_1
@@ -88,7 +92,7 @@ dependencies:
       - brotli==1.2.0
       - certifi==2026.2.25
       - charset-normalizer==3.4.7
-      - chumpy==0.71
+      - git+https://github.com/mattloper/chumpy@580566eafc9ac68b2614b64d6f7aaa84eebb70da
       - click==8.3.2
       - cloudpickle==3.1.2
       - colorlog==6.10.1

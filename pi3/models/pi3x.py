@@ -635,8 +635,12 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
                 outputs["pred_hand_scale"] = hand_outputs["pred_hand_scale"]
                 if "pred_hand_joints_3d" in hand_outputs:
                     outputs["pred_hand_joints_3d"] = hand_outputs["pred_hand_joints_3d"]
+                if "pred_hand_joints_local" in hand_outputs:
+                    outputs["pred_hand_joints_local"] = hand_outputs["pred_hand_joints_local"]
                 if "pred_hand_vertices" in hand_outputs:
                     outputs["pred_hand_vertices"] = hand_outputs["pred_hand_vertices"]
+                if "pred_hand_vertices_local" in hand_outputs:
+                    outputs["pred_hand_vertices_local"] = hand_outputs["pred_hand_vertices_local"]
                 outputs["hand_owner_index"] = hand_owner_index
                 outputs["hand_is_right"] = hand_is_right
                 outputs["hand_token_features"] = sparse_hand_features

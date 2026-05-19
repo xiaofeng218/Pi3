@@ -97,6 +97,15 @@ class _CapturingPi3XModel(_DummyPi3XModel):
         return super().forward(**kwargs)
 
 
+class _LocalJointPi3XModel(_DummyPi3XModel):
+    def forward(self, **kwargs):
+        out = super().forward(**kwargs)
+        num_hands = 0 if kwargs.get("hand_owner_index") is None else kwargs["hand_owner_index"].shape[0]
+        out["pred_hand_joints_local"] = torch.ones((num_hands, 21, 3), device=kwargs["imgs"].device)
+        out["pred_hand_vertices_local"] = torch.ones((num_hands, 778, 3), device=kwargs["imgs"].device)
+        return out
+
+
 class _Cfg(dict):
     __getattr__ = dict.__getitem__
     __setattr__ = dict.__setitem__
@@ -218,6 +227,59 @@ class Pi3XTrainerSmokeTests(unittest.TestCase):
         self.assertTrue(test_loss.to_calls)
         self.assertEqual(train_loss.to_calls[-1][0][0], torch.device("cpu"))
         self.assertEqual(test_loss.to_calls[-1][0][0], torch.device("cpu"))
+
+    def test_forward_batch_preserves_local_hand_joints_outputs(self) -> None:
+        trainer = Pi3XTrainer.__new__(Pi3XTrainer)
+        trainer.model = _LocalJointPi3XModel()
+        trainer.train_loss = torch.nn.Identity()
+        trainer.test_loss = torch.nn.Identity()
+        trainer.accelerator = type("A", (), {"device": torch.device("cpu")})()
+        batch = {
+            "views": [
+                {
+                    "img": torch.zeros((1, 3, 4, 4), dtype=torch.float32),
+                    "depthmap": torch.ones((1, 4, 4), dtype=torch.float32),
+                    "pts3d": torch.ones((1, 4, 4, 3), dtype=torch.float32),
+                    "valid_mask": torch.ones((1, 4, 4), dtype=torch.bool),
+                    "sparse_depth": torch.ones((1, 4, 4), dtype=torch.float32),
+                    "dataset": ["dexycb"],
+                    "camera_intrinsics": torch.eye(3, dtype=torch.float32).unsqueeze(0),
+                    "camera_pose": torch.eye(4, dtype=torch.float32).unsqueeze(0),
+                    "hand": {
+                        "mask": torch.ones((1, 4, 4), dtype=torch.float32),
+                        "valid": torch.tensor([True]),
+                        "pose_mano": torch.zeros((1, 48), dtype=torch.float32),
+                        "mano_betas": torch.zeros((1, 10), dtype=torch.float32),
+                        "hand_transl": torch.zeros((1, 3), dtype=torch.float32),
+                        "joints_3d_cam": torch.zeros((1, 21, 3), dtype=torch.float32),
+                        "joints_2d": torch.zeros((1, 21, 2), dtype=torch.float32),
+                        "mano_side": ["right"],
+                    },
+                    "object": {
+                        "mask": torch.zeros((1, 4, 4), dtype=torch.float32),
+                        "valid": torch.tensor([False]),
+                        "grasped_object_id": torch.tensor([1], dtype=torch.long),
+                        "pose_obj2cam": torch.eye(4, dtype=torch.float32).unsqueeze(0),
+                    },
+                    "object_multiview": {
+                        "img": torch.zeros((1, 3, 4, 4), dtype=torch.float32),
+                        "depthmap": torch.zeros((1, 4, 4), dtype=torch.float32),
+                        "camera_intrinsics": torch.eye(3, dtype=torch.float32).unsqueeze(0),
+                        "camera_pose": torch.eye(4, dtype=torch.float32).unsqueeze(0),
+                        "template_vertices": torch.zeros((8, 3), dtype=torch.float32),
+                        "normalization_center": torch.zeros((3,), dtype=torch.float32),
+                        "normalization_scale": torch.ones((1,), dtype=torch.float32),
+                    },
+                }
+            ]
+        }
+
+        pred, _gt = trainer.forward_batch(batch, mode="train")
+
+        self.assertIn("pred_hand_joints_local", pred)
+        self.assertIn("pred_hand_vertices_local", pred)
+        self.assertEqual(tuple(pred["pred_hand_joints_local"].shape), (1, 21, 3))
+        self.assertEqual(tuple(pred["pred_hand_vertices_local"].shape), (1, 778, 3))
 
     def test_build_optimizer_groups_trainable_modules_as_expected(self) -> None:
         cfg = _Cfg(type="AdamW", lr=1e-4, weight_decay=5e-2, betas=[0.9, 0.95], encoder_lr=1e-5)

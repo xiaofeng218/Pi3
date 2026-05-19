@@ -44,6 +44,7 @@ class DexYCBDataset(BaseDataset):
         data_root=None,
         split_style="s0_like_subject01",
         subject=None,
+        selected_tracks=None,
         local_window_radius=12,
         object_multiview_subdir="canonical_views_224",
         include_object_multiview_payload=False,
@@ -78,6 +79,7 @@ class DexYCBDataset(BaseDataset):
         if isinstance(subject, str):
             subject = [subject]
         self.subjects = list(subject)
+        self.selected_tracks = selected_tracks
         self.local_window_radius = local_window_radius
         self.object_multiview_subdir = object_multiview_subdir
         self.include_object_multiview_payload = bool(include_object_multiview_payload)
@@ -265,10 +267,59 @@ class DexYCBDataset(BaseDataset):
                         }
                     )
 
-        if self.max_tracks is not None and len(tracks) > self.max_tracks:
+        if self.selected_tracks is not None:
+            tracks = self._select_explicit_tracks(tracks)
+        elif self.max_tracks is not None and len(tracks) > self.max_tracks:
             tracks = tracks[: self.max_tracks]
 
         return tracks
+
+    def _select_explicit_tracks(self, tracks):
+        selectors = self.selected_tracks
+        if selectors is None:
+            return tracks
+        if hasattr(selectors, "items"):
+            selectors = dict(selectors)
+        else:
+            raise TypeError("selected_tracks must be a mapping from handedness to track selector")
+
+        selected = []
+        for side in ("left", "right"):
+            selector = selectors.get(side)
+            if selector is None:
+                raise ValueError(f"selected_tracks must define both 'left' and 'right'; missing {side!r}")
+            if hasattr(selector, "items"):
+                selector = dict(selector)
+            subject = selector.get("subject")
+            sequence = selector.get("sequence")
+            camera = selector.get("camera")
+            if not all(isinstance(value, str) and value for value in (subject, sequence, camera)):
+                raise ValueError(
+                    f"selected_tracks[{side!r}] must include non-empty subject/sequence/camera strings"
+                )
+
+            matches = [
+                track
+                for track in tracks
+                if track["subject"] == subject
+                and track["sequence"] == sequence
+                and track["camera"] == camera
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"selected_tracks[{side!r}] expected exactly one track for "
+                    f"{subject}/{sequence}/{camera}, found {len(matches)}"
+                )
+
+            match = matches[0]
+            if match["mano_side"] != side:
+                raise ValueError(
+                    f"selected_tracks[{side!r}] matched handedness {match['mano_side']!r} "
+                    f"for {subject}/{sequence}/{camera}"
+                )
+            selected.append(match)
+
+        return selected
 
     def _sample_frame_indices(self, track, rng):
         num_frames = track["num_frames"]

@@ -4,12 +4,101 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .hamer.geometry import rot6d_to_rotmat
 from pi3.utils.projection import project_points_cam_to_image_torch
+
+
+_HAND_JOINT_VIS_GT_COLOR = (64, 196, 255, 255)
+_HAND_JOINT_VIS_PRED_COLOR = (255, 96, 96, 255)
+_HAND_JOINT_VIS_CORR_COLOR = (255, 220, 96, 255)
+_HAND_JOINT_CHAINS = (
+    (0, 1, 2, 3, 4),
+    (0, 5, 6, 7, 8),
+    (0, 9, 10, 11, 12),
+    (0, 13, 14, 15, 16),
+    (0, 17, 18, 19, 20),
+)
+
+
+def _load_rerun():
+    try:
+        import rerun as rr  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("rerun is required for hand joint loss visualization") from exc
+    return rr
+
+
+def _solid_rgba(count: int, color: tuple[int, int, int, int]) -> np.ndarray:
+    return np.repeat(np.array([[*color]], dtype=np.uint8), count, axis=0)
+
+
+def _log_joint_correspondence_or_clear(rr, entity_path: str, gt_joints: np.ndarray, pred_joints: np.ndarray) -> None:
+    if gt_joints.shape != pred_joints.shape or gt_joints.ndim != 2 or gt_joints.shape[1] != 3:
+        rr.log(entity_path, rr.Clear(recursive=False))
+        return
+    strips = np.stack([gt_joints, pred_joints], axis=1)
+    rr.log(
+        entity_path,
+        rr.LineStrips3D(
+            strips=strips,
+            colors=_solid_rgba(strips.shape[0], _HAND_JOINT_VIS_CORR_COLOR),
+        ),
+    )
+
+
+def _log_hand_skeleton_or_clear(rr, entity_path: str, joints: np.ndarray, color: tuple[int, int, int, int]) -> None:
+    if joints.ndim != 2 or joints.shape != (21, 3):
+        rr.log(entity_path, rr.Clear(recursive=False))
+        return
+    strips = np.stack([joints[list(chain)] for chain in _HAND_JOINT_CHAINS], axis=0)
+    rr.log(
+        entity_path,
+        rr.LineStrips3D(
+            strips=strips,
+            colors=_solid_rgba(strips.shape[0], color),
+        ),
+    )
+
+
+def export_hand_joint_loss_rerun(
+    output_path: str | Path,
+    pred_joints: torch.Tensor,
+    gt_joints: torch.Tensor,
+    sample_name: str = "hand_joint_loss_debug",
+) -> Path:
+    rr = _load_rerun()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pred_np = np.asarray(pred_joints.detach().cpu(), dtype=np.float32)
+    gt_np = np.asarray(gt_joints.detach().cpu(), dtype=np.float32)
+
+    rr.init(sample_name, spawn=False)
+    rr.save(str(output_path))
+    rr.log("world/camera", rr.ViewCoordinates.RDF)
+    rr.log(
+        "world/gt_hand_joints",
+        rr.Points3D(
+            positions=gt_np,
+            colors=_solid_rgba(len(gt_np), _HAND_JOINT_VIS_GT_COLOR),
+        ),
+    )
+    _log_hand_skeleton_or_clear(rr, "world/gt_hand_skeleton", gt_np, _HAND_JOINT_VIS_GT_COLOR)
+    rr.log(
+        "world/pred_hand_joints",
+        rr.Points3D(
+            positions=pred_np,
+            colors=_solid_rgba(len(pred_np), _HAND_JOINT_VIS_PRED_COLOR),
+        ),
+    )
+    _log_hand_skeleton_or_clear(rr, "world/pred_hand_skeleton", pred_np, _HAND_JOINT_VIS_PRED_COLOR)
+    _log_joint_correspondence_or_clear(rr, "world/hand_joint_correspondence", gt_np, pred_np)
+    return output_path
 
 
 def _safe_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
@@ -140,6 +229,9 @@ class HandObjectLoss(nn.Module):
         object_2d_weight: float = 1.0,
         hand_discriminator_ckpt: str | None = None,
         hand_discriminator: nn.Module | None = None,
+        debug_hand_joints_vis_enabled: bool = False,
+        debug_hand_joints_vis_dir: str | None = None,
+        debug_hand_joints_vis_max_exports: int = 0,
     ) -> None:
         super().__init__()
         self.root_index = int(root_index)
@@ -154,6 +246,10 @@ class HandObjectLoss(nn.Module):
         self.object_rot_weight = float(object_rot_weight)
         self.object_transl_weight = float(object_transl_weight)
         self.object_scale_weight = float(object_scale_weight)
+        self.debug_hand_joints_vis_enabled = bool(debug_hand_joints_vis_enabled)
+        self.debug_hand_joints_vis_dir = None if debug_hand_joints_vis_dir in (None, "") else Path(debug_hand_joints_vis_dir)
+        self.debug_hand_joints_vis_max_exports = int(debug_hand_joints_vis_max_exports)
+        self._debug_hand_joints_vis_export_count = 0
         self.hand_discriminator = self._build_hand_discriminator(
             hand_adversarial_weight=self.hand_adversarial_weight,
             hand_discriminator_ckpt=hand_discriminator_ckpt,
@@ -242,6 +338,45 @@ class HandObjectLoss(nn.Module):
         else:
             loss = loss.mean()
         return loss
+
+    def _maybe_export_debug_hand_joints(
+        self,
+        pred_joints: torch.Tensor,
+        gt_joints: torch.Tensor,
+        per_sample_joint_loss: torch.Tensor,
+        hand_valid: torch.Tensor | None,
+        hand_is_right: torch.Tensor | None,
+    ) -> None:
+        if not self.debug_hand_joints_vis_enabled:
+            return
+        if self.debug_hand_joints_vis_max_exports <= 0:
+            return
+        if self._debug_hand_joints_vis_export_count >= self.debug_hand_joints_vis_max_exports:
+            return
+        if self.debug_hand_joints_vis_dir is None:
+            return
+
+        valid_mask = torch.ones_like(per_sample_joint_loss, dtype=torch.bool)
+        if hand_valid is not None:
+            valid_mask = valid_mask & hand_valid.bool()
+        if not valid_mask.any():
+            return
+
+        valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
+        target_index = valid_indices[per_sample_joint_loss[valid_mask].argmax()].item()
+        side_name = "unknown"
+        if hand_is_right is not None and hand_is_right.numel() > target_index:
+            side_name = "right" if bool(hand_is_right[target_index].item()) else "left"
+        output_path = self.debug_hand_joints_vis_dir / (
+            f"hand_joint_loss_{self._debug_hand_joints_vis_export_count:04d}_{side_name}_idx{target_index:03d}.rrd"
+        )
+        export_hand_joint_loss_rerun(
+            output_path=output_path,
+            pred_joints=pred_joints[target_index],
+            gt_joints=gt_joints[target_index],
+            sample_name=f"hand_joint_loss_{side_name}_{self._debug_hand_joints_vis_export_count:04d}",
+        )
+        self._debug_hand_joints_vis_export_count += 1
 
     def _project_hand_joints_2d(self, pred_joints_3d: torch.Tensor, intrinsics: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return project_points_cam_to_image_torch(pred_joints_3d, intrinsics)
@@ -386,6 +521,13 @@ class HandObjectLoss(nn.Module):
                     pred_joints = _root_relative(pred["pred_hand_joints_3d"], self.root_index)
                     gt_joints = _root_relative(gt["hand_joints_3d"], self.root_index)
                 hand_joints_loss = F.l1_loss(pred_joints, gt_joints, reduction="none").mean(dim=(-1, -2)) * 10.0
+                self._maybe_export_debug_hand_joints(
+                    pred_joints=pred_joints,
+                    gt_joints=gt_joints,
+                    per_sample_joint_loss=hand_joints_loss,
+                    hand_valid=hand_valid,
+                    hand_is_right=gt.get("hand_is_right", None),
+                )
                 hand_joints_loss = self._masked_mean(hand_joints_loss, hand_valid)
                 details["hand_joints_3d_loss"] = _as_scalar(hand_joints_loss)
                 weighted_details["hand_joints_3d_loss"] = _as_scalar(self.geom_weight * self.hand_joints_3d_weight * hand_joints_loss)

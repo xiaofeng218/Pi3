@@ -6,11 +6,20 @@ defaults:
 
 name: pi3x_overfit
 
-# Dataset: overfit on a single fixed track with 3 frames per sample.
+# Dataset: overfit on two fixed tracks with 3 frames per sample:
+# one right-hand track and one left-hand track.
 train_dataset:
   data_root: ${oc.env:DEXYCB_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/dexycb}
   frame_num: 3
-  max_tracks: 1
+  selected_tracks:
+    right:
+      subject: 20200709-subject-01
+      sequence: "20200709_141754"
+      camera: "836212060125"
+    left:
+      subject: 20200709-subject-01
+      sequence: "20200709_141931"
+      camera: "836212060125"
   fix_epoch_seed: true
   resolution:
     - [224, 224]
@@ -20,7 +29,15 @@ test_dataset:
   data_root: ${oc.env:DEXYCB_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/dexycb}
   mode: train
   frame_num: 3
-  max_tracks: 1
+  selected_tracks:
+    right:
+      subject: 20200709-subject-01
+      sequence: "20200709_141754"
+      camera: "836212060125"
+    left:
+      subject: 20200709-subject-01
+      sequence: "20200709_141931"
+      camera: "836212060125"
   fix_epoch_seed: true
   resolution:
     - [224, 224]
@@ -56,7 +73,7 @@ train:
 test:
   use_train_loader: true
   image_num_range: [3, 3]
-  iters_per_test: 1
+  iters_per_test: 2
   batch_size: 1
   num_workers: 0
 
@@ -67,7 +84,7 @@ log:
 
 vis:
   enabled: true
-  interval: 5
+  interval: ${train.iters_per_epoch}
   sample_index: 0
   output_subdir: rerun
   item_name: pi3x_overfit_sample

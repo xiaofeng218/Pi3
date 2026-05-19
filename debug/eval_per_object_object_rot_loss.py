@@ -6,7 +6,6 @@ import os
 import sys
 from collections import defaultdict
 from pathlib import Path
-from types import MethodType
 from unittest import mock
 
 import torch
@@ -152,8 +151,10 @@ def _normalize_object_multiview_device(batch, device: torch.device):
     return batch
 
 
-def _wrap_hydrate_object_payload_to_device(trainer: Pi3XTrainer) -> None:
-    original = trainer._hydrate_object_multiview_payload
+def _maybe_wrap_hydrate_object_payload_to_device(trainer: Pi3XTrainer) -> None:
+    original = getattr(trainer, "_hydrate_object_multiview_payload", None)
+    if original is None:
+        return
 
     def _wrapped(self, object_multiview, batch_size):
         payload = original(object_multiview, batch_size)
@@ -162,7 +163,31 @@ def _wrap_hydrate_object_payload_to_device(trainer: Pi3XTrainer) -> None:
                 payload[key] = value.to(device=self.accelerator.device)
         return payload
 
-    trainer._hydrate_object_multiview_payload = MethodType(_wrapped, trainer)
+    trainer._hydrate_object_multiview_payload = _wrapped.__get__(trainer, type(trainer))
+
+
+def _extract_object_ids(batch, device: torch.device) -> torch.Tensor:
+    if not isinstance(batch, dict):
+        raise TypeError(f"Expected dict batch with `views`, got {type(batch).__name__}")
+    views = batch.get("views", None)
+    if not isinstance(views, list) or not views:
+        raise KeyError("Batch is missing non-empty `views`")
+    first_view = views[0]
+    if not isinstance(first_view, dict):
+        raise TypeError("Batch `views[0]` must be a dict")
+    object_payload = first_view.get("object", None)
+    if not isinstance(object_payload, dict) or "grasped_object_id" not in object_payload:
+        raise KeyError("Batch `views[0].object.grasped_object_id` is required")
+    return torch.as_tensor(object_payload["grasped_object_id"], device=device, dtype=torch.long).reshape(-1)
+
+
+def _extract_views_batch_for_rerun(batch):
+    if isinstance(batch, dict):
+        views = batch.get("views", None)
+        if not isinstance(views, list) or not views:
+            raise KeyError("Rerun export requires batch['views'] to be a non-empty list")
+        return views
+    return batch
 
 
 def _safe_class_name(object_id: int) -> str:
@@ -220,7 +245,7 @@ def main() -> None:
     checkpoint_dir = Path(args.checkpoint).resolve()
     output_dir = Path(args.output_dir).resolve()
     trainer = _build_trainer(subject=args.subject, output_dir=output_dir)
-    _wrap_hydrate_object_payload_to_device(trainer)
+    _maybe_wrap_hydrate_object_payload_to_device(trainer)
     trainer.load_training_state(str(checkpoint_dir))
     trainer.model.eval()
     trainer.before_epoch(0)
@@ -245,14 +270,11 @@ def main() -> None:
             pred_rot = rot6d_to_rotmat(pred["pred_object_rot6d"].reshape(-1, 6)).reshape(gt_rot.shape)
             object_rot_per_view = F.mse_loss(pred_rot, gt_rot, reduction="none").mean(dim=(-1, -2))
             object_valid = gt["object_valid"]
-            object_ids = torch.stack(
-                [view["object_multiview"]["grasped_object_id"] for view in batch],
-                dim=1,
-            ).to(object_valid.device)
+            object_ids = _extract_object_ids(batch, device=object_valid.device)
 
             batch_size = object_valid.shape[0]
             for batch_idx in range(batch_size):
-                object_id = int(object_ids[batch_idx, 0].item())
+                object_id = int(object_ids[batch_idx].item())
                 valid_losses = object_rot_per_view[batch_idx][object_valid[batch_idx]]
                 if valid_losses.numel() == 0:
                     continue
@@ -266,7 +288,7 @@ def main() -> None:
                     output_path = export_dir / "sample_000.rrd"
                     export_pi3x_rerun_sample(
                         output_path=output_path,
-                        batch=batch,
+                        batch=_extract_views_batch_for_rerun(batch),
                         pred=pred,
                         gt=gt,
                         sample_index=batch_idx,

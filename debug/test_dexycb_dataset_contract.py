@@ -139,6 +139,7 @@ def build_fixture(root: Path) -> None:
     }
     write_yaml(root / "calibration" / "extrinsics_fixture" / "extrinsics.yml", extrinsics)
     write_yaml(root / "calibration" / "mano_fixture_subject-01_right" / "mano.yml", {"betas": [0.01] * 10})
+    write_yaml(root / "calibration" / "mano_fixture_subject-01_left" / "mano.yml", {"betas": [0.02] * 10})
 
     intrinsics_mv = np.repeat(
         np.array([[160.0, 0.0, 111.5], [0.0, 160.0, 111.5], [0.0, 0.0, 1.0]], dtype=np.float32)[None, :, :],
@@ -183,14 +184,16 @@ def build_fixture(root: Path) -> None:
     subject_root = root / "20200709-subject-01"
     for seq_idx in range(5):
         sequence = subject_root / f"20200709_1418{seq_idx:02d}"
+        mano_side = "left" if seq_idx == 2 else "right"
+        mano_calib = f"mano_fixture_subject-01_{mano_side}"
         meta = {
             "serials": SERIALS,
             "num_frames": 4,
             "extrinsics": "fixture",
             "ycb_ids": [object_id],
             "ycb_grasp_ind": 0,
-            "mano_sides": ["right"],
-            "mano_calib": ["mano_fixture_subject-01_right"],
+            "mano_sides": [mano_side],
+            "mano_calib": [mano_calib],
         }
         write_yaml(sequence / "meta.yml", meta)
         np.savez(
@@ -330,6 +333,28 @@ def main() -> None:
         assert payload_mv["pts3d"].shape == (8, 224, 224, 3)
         train_mv = train_dataset.get_object_multiview_payload(11)
         assert "pts3d" not in train_mv
+
+        selected_dataset = DexYCBDataset(
+            data_root=str(root),
+            mode="train",
+            resolution=[[224, 224]],
+            frame_num=3,
+            selected_tracks={
+                "right": {
+                    "subject": "20200709-subject-01",
+                    "sequence": "20200709_141800",
+                    "camera": SERIALS[0],
+                },
+                "left": {
+                    "subject": "20200709-subject-01",
+                    "sequence": "20200709_141802",
+                    "camera": SERIALS[1],
+                },
+            },
+        )
+        assert len(selected_dataset) == 2, len(selected_dataset)
+        assert {track["mano_side"] for track in selected_dataset.tracks} == {"left", "right"}
+        assert {track["sequence"] for track in selected_dataset.tracks} == {"20200709_141800", "20200709_141802"}
 
 
 if __name__ == "__main__":

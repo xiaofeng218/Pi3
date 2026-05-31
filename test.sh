@@ -4,6 +4,7 @@ set -euo pipefail
 EXPERIMENT_ROOT="${1:-outputs/full1.1}"
 SUBJECT="${2:-20200709-subject-01}"
 CHECKPOINT_NAME="${3:-}"
+SPLIT="${4:-train}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -28,12 +29,13 @@ if [ -z "${CHECKPOINT_DIR:-}" ] || [ ! -d "$CHECKPOINT_DIR" ]; then
 fi
 
 OUTPUT_DIR="${EXPERIMENT_ROOT%/}/per_object_eval"
-RERUN_DIR="${OUTPUT_DIR}/rerun_per_object"
+RERUN_DIR="${OUTPUT_DIR}/rerun_per_object_${SPLIT}"
 
 echo "Running per-object object rotation evaluation"
 echo "  experiment_root: $EXPERIMENT_ROOT"
 echo "  checkpoint:      $CHECKPOINT_DIR"
 echo "  subject:         $SUBJECT"
+echo "  split:           $SPLIT"
 echo "  output_dir:      $OUTPUT_DIR"
 echo "  rerun_dir:       $RERUN_DIR"
 echo
@@ -41,6 +43,7 @@ echo
 python debug/eval_per_object_object_rot_loss.py \
     --checkpoint "$CHECKPOINT_DIR" \
     --subject "$SUBJECT" \
+    --split "$SPLIT" \
     --output-dir "$OUTPUT_DIR" \
     --export-rerun \
     --rerun-dir "$RERUN_DIR" \

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -79,34 +82,28 @@ class HandObjectLossContractTests(unittest.TestCase):
         self.assertAlmostEqual(float(details["hand_joints_3d_loss"]), 0.0, places=5)
         self.assertNotIn("hand_vertices_loss", details)
 
-    def test_hand_scale_gt_uses_hand_owner_index(self) -> None:
+    def test_hand_scale_gt_uses_dense_scene_scale_broadcast(self) -> None:
         loss = HandObjectLoss()
         pred = {
-            "pred_hand_transl_dir": torch.tensor([[0.0, 0.0, 1.0]] * 4),
-            "pred_hand_transl": torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 2.0], [0.0, 0.0, 3.0], [0.0, 0.0, 4.0]]),
-            "pred_hand_transl_scale": torch.ones(4, 1),
-            "pred_hand_scale": torch.ones(4, 1),
+            "pred_hand_transl_dir": torch.tensor([[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]]),
+            "pred_hand_transl": torch.tensor(
+                [
+                    [[0.0, 0.0, 1.0], [0.0, 0.0, 2.0]],
+                    [[0.0, 0.0, 3.0], [0.0, 0.0, 4.0]],
+                ]
+            ),
+            "pred_hand_transl_scale": torch.ones(2, 2, 1),
+            "pred_hand_scale": torch.ones(2, 2, 1),
         }
         gt = {
-            "hand_valid": torch.tensor([True, True, True, True]),
+            "hand_valid": torch.tensor([[True, True], [True, True]]),
             "hand_transl": torch.tensor(
                 [
-                    [0.0, 0.0, 1.0],
-                    [0.0, 0.0, 2.0],
-                    [0.0, 0.0, 3.0],
-                    [0.0, 0.0, 4.0],
+                    [[0.0, 0.0, 1.0], [0.0, 0.0, 2.0]],
+                    [[0.0, 0.0, 3.0], [0.0, 0.0, 4.0]],
                 ]
             ),
             "scene_scale": torch.tensor([2.0, 5.0]),
-            "hand_owner_index": torch.tensor(
-                [
-                    [0, 0, 0],
-                    [1, 0, 0],
-                    [1, 1, 0],
-                    [0, 1, 0],
-                ],
-                dtype=torch.long,
-            ),
         }
 
         total, details = loss(pred, gt)
@@ -114,6 +111,87 @@ class HandObjectLossContractTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(total))
         self.assertIn("hand_transl_loss", details)
         self.assertIn("hand_full_scale_loss", details)
+
+    def test_debug_hand_joint_export_flattens_dense_hand_is_right(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            loss = HandObjectLoss(
+                debug_hand_joints_vis_enabled=True,
+                debug_hand_joints_vis_dir=tmpdir,
+                debug_hand_joints_vis_max_exports=1,
+            )
+            pred = {
+                "pred_hand_transl_dir": torch.zeros(1, 2, 3),
+                "pred_hand_transl": torch.zeros(1, 2, 3),
+                "pred_hand_transl_scale": torch.ones(1, 2, 1),
+                "pred_hand_scale": torch.ones(1, 2, 1),
+                "pred_hand_joints_local": torch.zeros(1, 2, 21, 3),
+            }
+            gt = {
+                "hand_valid": torch.tensor([[True, True]], dtype=torch.bool),
+                "hand_transl": torch.zeros(1, 2, 3),
+                "scene_scale": torch.ones(1),
+                "hand_global_orient_rotmat": torch.eye(3).view(1, 1, 1, 3, 3).repeat(1, 2, 1, 1, 1),
+                "hand_pose_rotmat": torch.eye(3).view(1, 1, 1, 3, 3).repeat(1, 2, 15, 1, 1),
+                "hand_joints_3d": torch.ones(1, 2, 21, 3),
+                "hand_is_right": torch.tensor([[True, False]], dtype=torch.bool),
+            }
+
+            with patch(
+                "pi3.models.hand_object_loss.export_hand_joint_loss_rerun",
+                return_value=Path(tmpdir) / "x.rrd",
+            ) as mocked:
+                total, details = loss(pred, gt)
+
+            self.assertTrue(torch.isfinite(total))
+            self.assertIn("hand_joints_3d_loss", details)
+            self.assertEqual(mocked.call_count, 1)
+
+    def test_debug_hand_joint_export_flattens_dense_bn_indices(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            loss = HandObjectLoss(
+                debug_hand_joints_vis_enabled=True,
+                debug_hand_joints_vis_dir=tmpdir,
+                debug_hand_joints_vis_max_exports=1,
+            )
+            pred = {
+                "pred_hand_transl_dir": torch.zeros(3, 1, 3),
+                "pred_hand_transl": torch.zeros(3, 1, 3),
+                "pred_hand_transl_scale": torch.ones(3, 1, 1),
+                "pred_hand_scale": torch.ones(3, 1, 1),
+                "pred_hand_joints_local": torch.zeros(3, 1, 21, 3),
+            }
+            gt = {
+                "hand_valid": torch.tensor([[True], [True], [True]], dtype=torch.bool),
+                "hand_transl": torch.zeros(3, 1, 3),
+                "scene_scale": torch.ones(3),
+                "hand_global_orient_rotmat": torch.eye(3).view(1, 1, 1, 3, 3).repeat(3, 1, 1, 1, 1),
+                "hand_pose_rotmat": torch.eye(3).view(1, 1, 1, 3, 3).repeat(3, 1, 15, 1, 1),
+                "hand_joints_3d": torch.tensor(
+                    [
+                        [[[0.0, 0.0, 0.0]] * 21],
+                        [[[1.0, 0.0, 0.0]] * 21],
+                        [[[2.0, 0.0, 0.0]] * 21],
+                    ],
+                    dtype=torch.float32,
+                ),
+                "hand_is_right": torch.tensor([[True], [False], [True]], dtype=torch.bool),
+            }
+
+            captured = {}
+
+            def _capture_export(*, pred_joints, gt_joints, **kwargs):
+                captured["pred_joints"] = pred_joints.detach().clone()
+                captured["gt_joints"] = gt_joints.detach().clone()
+                return Path(tmpdir) / "x.rrd"
+
+            with patch("pi3.models.hand_object_loss.export_hand_joint_loss_rerun", side_effect=_capture_export) as mocked:
+                total, details = loss(pred, gt)
+
+            self.assertTrue(torch.isfinite(total))
+            self.assertIn("hand_joints_3d_loss", details)
+            self.assertEqual(mocked.call_count, 1)
+            self.assertEqual(tuple(captured["pred_joints"].shape), (21, 3))
+            self.assertEqual(tuple(captured["gt_joints"].shape), (21, 3))
 
     def test_log_scale_losses_use_log_predictions_directly(self) -> None:
         loss = HandObjectLoss()
@@ -275,7 +353,6 @@ class HandObjectLossContractTests(unittest.TestCase):
         }
         gt = {
             "hand_valid": torch.tensor([False]),
-            "hand_owner_index": torch.tensor([[0, 0, 0]], dtype=torch.long),
             "hand_transl": torch.zeros((1, 3), dtype=torch.float32),
             "scene_scale": torch.tensor([1.0]),
             "hand_global_orient_rotmat": torch.eye(3, dtype=torch.float32).view(1, 1, 3, 3),

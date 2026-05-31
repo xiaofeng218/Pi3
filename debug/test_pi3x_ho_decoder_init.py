@@ -60,26 +60,63 @@ class HOBlockWarmStartTests(unittest.TestCase):
             self.assertTrue(torch.equal(ho_blk.norm1.weight, blk.norm1.weight))
             self.assertTrue(torch.equal(ho_blk.norm3.weight, blk.norm2.weight))
             self.assertTrue(torch.equal(ho_blk.cross_attn.proj.weight, blk.attn.proj.weight))
-            self.assertTrue(torch.allclose(ho_blk.ls_y.gamma, torch.full_like(ho_blk.ls_y.gamma, 1e-3)))
+            self.assertTrue(torch.equal(ho_blk.ls_y.gamma, blk.ls1.gamma))
+
+    def test_helper_defaults_cross_attn_layer_scale_to_decoder_self_attn_scale(self) -> None:
+        model = Pi3X(use_multimodal=False).eval()
+        blk = model.decoder[0]
+        ho_blk = HOBlockRope(
+            dim=model.dec_embed_dim,
+            num_heads=16,
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            proj_bias=True,
+            ffn_bias=True,
+            act_layer=torch.nn.GELU,
+            norm_layer=type(blk.norm1),
+            ffn_layer=type(blk.mlp),
+            init_values=0.01,
+            qk_norm=True,
+            attn_class=type(blk.attn),
+            rope=model.rope,
+        )
+
+        init_ho_block_from_decoder_block(ho_blk, blk)
+
+        self.assertTrue(torch.equal(ho_blk.ls_y.gamma, blk.ls1.gamma))
+
+    def test_pi3x_cross_alpha_parameters_start_at_zero(self) -> None:
+        model = Pi3X(use_multimodal=False).eval()
+
+        self.assertTrue(torch.allclose(model.ho_hand_scene_cross_alpha, torch.zeros_like(model.ho_hand_scene_cross_alpha)))
+        self.assertTrue(torch.allclose(model.ho_object_scene_cross_alpha, torch.zeros_like(model.ho_object_scene_cross_alpha)))
 
     def test_pi3x_ckpt_loads_ho_and_lazy_hand_head_weights(self) -> None:
         model = Pi3X(use_multimodal=False).eval()
-        hand_head = model._get_hand_mano_head(torch.device("cpu"))
         with torch.no_grad():
             model.ho_decoder[0].ls_y.gamma.fill_(0.25)
-            hand_head.dectransl_scale.bias.fill_(0.5)
-            hand_head.decscale.bias.fill_(1.5)
+            model.ho_hand_scene_cross_alpha[0] = 0.5
+            model.ho_object_scene_cross_alpha[1] = 0.75
+            model.ho_object_scene_cross_alpha[1] = 0.75
+            model.hand_pose_head.decpose.bias.fill_(0.5)
+        state_dict = {
+            "ho_decoder.0.ls_y.gamma": model.ho_decoder[0].ls_y.gamma.detach().clone(),
+            "ho_hand_scene_cross_alpha": model.ho_hand_scene_cross_alpha.detach().clone(),
+            "ho_object_scene_cross_alpha": model.ho_object_scene_cross_alpha.detach().clone(),
+            "hand_pose_head.decpose.bias": model.hand_pose_head.decpose.bias.detach().clone(),
+        }
 
         with tempfile.TemporaryDirectory(prefix="pi3x_ckpt_") as tmpdir:
             ckpt_path = Path(tmpdir) / "pi3x.pt"
-            torch.save({"state_dict": model.state_dict()}, ckpt_path)
+            torch.save({"state_dict": state_dict}, ckpt_path)
 
             loaded = Pi3X(use_multimodal=False, ckpt=str(ckpt_path)).eval()
 
         self.assertIsNotNone(loaded.hand_mano_head)
         self.assertTrue(torch.allclose(loaded.ho_decoder[0].ls_y.gamma, model.ho_decoder[0].ls_y.gamma))
-        self.assertTrue(torch.allclose(loaded.hand_mano_head.dectransl_scale.bias, hand_head.dectransl_scale.bias))
-        self.assertTrue(torch.allclose(loaded.hand_mano_head.decscale.bias, hand_head.decscale.bias))
+        self.assertTrue(torch.allclose(loaded.ho_hand_scene_cross_alpha, model.ho_hand_scene_cross_alpha))
+        self.assertTrue(torch.allclose(loaded.ho_object_scene_cross_alpha, model.ho_object_scene_cross_alpha))
+        self.assertTrue(torch.allclose(loaded.hand_pose_head.decpose.bias, model.hand_pose_head.decpose.bias))
 
 
 if __name__ == "__main__":

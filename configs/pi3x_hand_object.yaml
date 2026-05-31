@@ -4,7 +4,7 @@ defaults:
   - model: pi3x_hand_object
   - train: train_pi3x_hand_object
   - loss: hand_object_loss
-  - data: dexycb_hand_object.yaml
+  - data: forehoi_hand_object.yaml
   - hand_encoder: pi3x_hamer_encoder
   - general: default.yaml
   - extras: default.yaml

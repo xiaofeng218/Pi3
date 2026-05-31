@@ -11,7 +11,9 @@ train_loss:
   hand_adversarial_weight: 0.0
   object_rot_weight: 1.0
   object_transl_weight: 1.0
-  object_scale_weight: 0.5
+  object_scale_weight: 1.0
+  omv_point_weight: 1.0
+  omv_camera_weight: 1.0
   hand_discriminator_ckpt: ${model.hamer_cache_dir}/hamer_ckpts/checkpoints/hamer.ckpt
   debug_hand_joints_vis_enabled: true
   debug_hand_joints_vis_dir: ${log.output_dir}/debug_hand_joints
@@ -27,10 +29,12 @@ test_loss:
   hand_pose_weight: 0.5
   hand_joints_3d_weight: 0.5
   hand_2d_weight: 0.0
-  hand_adversarial_weight: 0.1
+  hand_adversarial_weight: 0.0
   object_rot_weight: 1.0
   object_transl_weight: 1.0
-  object_scale_weight: 0.5
+  object_scale_weight: 1.0
+  omv_point_weight: 1.0
+  omv_camera_weight: 1.0
   hand_discriminator_ckpt: ${model.hamer_cache_dir}/hamer_ckpts/checkpoints/hamer.ckpt
   debug_hand_joints_vis_enabled: false
   debug_hand_joints_vis_dir: ${log.output_dir}/debug_hand_joints

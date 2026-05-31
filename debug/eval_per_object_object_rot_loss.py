@@ -54,7 +54,7 @@ def _set_default_asset_env() -> None:
     )
 
 
-def _build_trainer(subject: str, output_dir: Path) -> Pi3XTrainer:
+def _build_trainer(subject: str, output_dir: Path, split: str = "test") -> Pi3XTrainer:
     config_dir = str(REPO_ROOT / "configs")
     overrides = [
         "name=eval_per_object_object_rot_loss",
@@ -74,6 +74,8 @@ def _build_trainer(subject: str, output_dir: Path) -> Pi3XTrainer:
         "train.model_dtype=fp32",
         f"train_dataset.subject={subject}",
         f"test_dataset.subject={subject}",
+        f"train_dataset.mode={split}",
+        f"test_dataset.mode={split}",
     ]
     with initialize_config_dir(config_dir=config_dir, job_name="eval_per_object_object_rot_loss", version_base=None):
         cfg = compose(config_name="pi3x_hand_object", overrides=overrides)
@@ -190,6 +192,12 @@ def _extract_views_batch_for_rerun(batch):
     return batch
 
 
+def _resolve_eval_loader(trainer: Pi3XTrainer, split: str):
+    if split == "train":
+        return trainer.train_loader
+    return trainer.test_loader
+
+
 def _safe_class_name(object_id: int) -> str:
     return _YCB_CLASSES.get(object_id, f"object_{object_id:02d}").replace("/", "_")
 
@@ -212,6 +220,12 @@ def main() -> None:
         help="DexYCB subject to evaluate.",
     )
     parser.add_argument(
+        "--split",
+        choices=("train", "test"),
+        default="test",
+        help="Dataset split to evaluate. Defaults to the test split.",
+    )
+    parser.add_argument(
         "--output-dir",
         default=str(REPO_ROOT / "outputs" / "debug_eval_per_object_rot"),
         help="Temporary output directory for Hydra/trainer logs.",
@@ -220,7 +234,7 @@ def main() -> None:
         "--max-batches",
         type=int,
         default=0,
-        help="Optional cap on evaluated batches. Use 0 to evaluate the full test split.",
+        help="Optional cap on evaluated batches. Use 0 to evaluate the full selected split.",
     )
     parser.add_argument(
         "--progress-every",
@@ -244,11 +258,12 @@ def main() -> None:
 
     checkpoint_dir = Path(args.checkpoint).resolve()
     output_dir = Path(args.output_dir).resolve()
-    trainer = _build_trainer(subject=args.subject, output_dir=output_dir)
+    trainer = _build_trainer(subject=args.subject, output_dir=output_dir, split=args.split)
     _maybe_wrap_hydrate_object_payload_to_device(trainer)
     trainer.load_training_state(str(checkpoint_dir))
     trainer.model.eval()
     trainer.before_epoch(0)
+    eval_loader = _resolve_eval_loader(trainer, split=args.split)
 
     per_object_track_mean: dict[int, list[float]] = defaultdict(list)
     per_object_view_losses: dict[int, list[float]] = defaultdict(list)
@@ -258,7 +273,7 @@ def main() -> None:
     rerun_dir = Path(args.rerun_dir).resolve() if args.rerun_dir else output_dir / "rerun_per_object"
 
     with torch.no_grad():
-        for batch in trainer.test_loader:
+        for batch in eval_loader:
             num_batches += 1
             if args.max_batches > 0 and num_batches > args.max_batches:
                 break
@@ -312,6 +327,7 @@ def main() -> None:
 
     print(f"checkpoint: {checkpoint_dir}")
     print(f"subject: {args.subject}")
+    print(f"split: {args.split}")
     print(f"num_batches: {num_batches}")
     print()
     print(

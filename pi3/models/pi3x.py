@@ -9,6 +9,8 @@ from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 
 from .layers.conv_head import ConvHead
 from .layers.camera_head import CameraHead
+from .layers.hand_global_head import HandGlobalHead
+from .layers.hand_pose_head import HandPoseHead
 from .layers.hand_token_adapter import HandTokenAdapter
 from .layers.object_pose_head import ObjectPoseHead
 from .layers.object_query_adapter import ObjectQueryAdapter
@@ -34,7 +36,6 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
             hamer_config_file=None,
             hamer_cache_dir=None,
             hand_encoder_cfg=None,
-            ho_lora_cfg=None,
         ):
         super().__init__()
 
@@ -43,7 +44,8 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         self.hamer_config_file = hamer_config_file
         self.hamer_cache_dir = hamer_cache_dir
         self.hand_encoder_cfg = hand_encoder_cfg
-        self.ho_lora_cfg = ho_lora_cfg
+        self.hand_hamer_cfg = self._load_hamer_config()
+        self.hand_num_joints = int(self.hand_hamer_cfg.MANO.NUM_HAND_JOINTS)
         self.hand_mano_layer = self._build_hand_mano_layer()
         self.hand_encoder = self._build_hand_encoder()
         self._last_load_report = None
@@ -104,9 +106,6 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
             ) for _ in range(dec_depth)
         ])
         self.dec_embed_dim = dec_embed_dim
-        for ho_blk in self.ho_decoder:
-            if self.ho_lora_cfg is not None:
-                ho_blk.enable_lora(**self.ho_lora_cfg)
 
         num_register_tokens = 5
         self.patch_start_idx = num_register_tokens
@@ -223,11 +222,70 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
             using_uv=True
         )
 
+        ## ------------- OMV Point & Camera (trainable copies) -------------------
+        self.omv_point_decoder = deepcopy(self.point_decoder)
+        self.omv_point_head = deepcopy(self.point_head)
+        self.omv_camera_decoder = deepcopy(self.camera_decoder)
+        self.omv_camera_head = deepcopy(self.camera_head)
+
         ## ------------- Hand & Object -------------------
         self.hand_token_adapter = HandTokenAdapter(token_dim=self.dec_embed_dim, patch_size=self.patch_size)
         self.object_query_adapter = ObjectQueryAdapter(token_dim=self.dec_embed_dim, patch_size=self.patch_size)
-        self.object_pose_head = ObjectPoseHead(in_dim=2 * self.dec_embed_dim, hidden_dim=self.dec_embed_dim)
+        self.hand_hamer_token_dim = int(getattr(self.hand_encoder, "output_dim", self.dec_embed_dim))
+        self.hand_fuse_input_dim = self.hand_hamer_token_dim + self.dec_embed_dim
+        self.local_task_dim = 512
+        hand_crop_h, hand_crop_w = tuple(self.hand_token_adapter.crop_hw)
+        object_crop_h, object_crop_w = tuple(self.object_query_adapter.crop_hw)
+        self.hand_task_patch_h = hand_crop_h // self.patch_size
+        self.hand_task_patch_w = hand_crop_w // self.patch_size
+        self.object_task_patch_h = object_crop_h // self.patch_size
+        self.object_task_patch_w = object_crop_w // self.patch_size
+        self.hand_global_decoder = TransformerDecoder(
+            in_dim=2 * self.dec_embed_dim,
+            dec_embed_dim=self.local_task_dim,
+            dec_num_heads=8,
+            out_dim=self.local_task_dim,
+            depth=1,
+            rope=self.rope,
+        )
+        self.hand_pose_decoder = TransformerDecoder(
+            in_dim=2 * self.dec_embed_dim,
+            dec_embed_dim=self.local_task_dim,
+            dec_num_heads=8,
+            out_dim=self.local_task_dim,
+            depth=1,
+            rope=self.rope,
+        )
+        self.object_pose_decoder = TransformerDecoder(
+            in_dim=2 * self.dec_embed_dim,
+            dec_embed_dim=self.local_task_dim,
+            dec_num_heads=8,
+            out_dim=self.local_task_dim,
+            depth=1,
+            rope=self.rope,
+        )
+        self.hand_global_head = HandGlobalHead(
+            in_dim=self.local_task_dim,
+            hidden_dim=self.local_task_dim,
+            patch_h=self.hand_task_patch_h,
+            patch_w=self.hand_task_patch_w,
+        )
+        self.hand_pose_head = self._build_hand_pose_head()
+        self.object_pose_head = ObjectPoseHead(
+            in_dim=self.local_task_dim,
+            hidden_dim=self.local_task_dim,
+            patch_h=self.object_task_patch_h,
+            patch_w=self.object_task_patch_w,
+        )
         self.hand_mano_head = self._build_hand_mano_head()
+        self.hand_token_fuse = nn.Sequential(
+            nn.LayerNorm(self.hand_fuse_input_dim),
+            nn.Linear(self.hand_fuse_input_dim, self.dec_embed_dim),
+            nn.GELU(),
+            nn.Linear(self.dec_embed_dim, self.dec_embed_dim),
+        )
+        self.ho_hand_scene_cross_alpha = nn.Parameter(torch.zeros(dec_depth))
+        self.ho_object_scene_cross_alpha = nn.Parameter(torch.zeros(dec_depth))
 
         # For ImageNet Normalize
         image_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -354,14 +412,7 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         return hand_encoder
 
     def _build_hand_mano_layer(self):
-        default_config_file, _ = self._default_hamer_paths()
-        config_file = self.hamer_config_file or str(default_config_file)
-
-        config_path = Path(config_file)
-        if not config_path.exists():
-            raise FileNotFoundError(f"HaMeR config file not found: {config_path}")
-
-        hamer_cfg = self._load_hamer_config()
+        hamer_cfg = self.hand_hamer_cfg
         mano_cfg = {key.lower(): value for key, value in dict(hamer_cfg.MANO).items()}
         mano_data_dir = mano_cfg.get("data_dir", None)
         mano_cfg["model_path"] = resolve_mano_path_template(mano_cfg.get("model_path"), mano_data_dir)
@@ -387,70 +438,54 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         )
 
     def _build_hand_mano_head(self):
-        hamer_cfg = self._load_hamer_config()
         return HandMANOHead(
-            hamer_cfg,
-            in_dim=2 * self.dec_embed_dim,
-            hidden_dim=self.dec_embed_dim,
+            self.hand_hamer_cfg,
             mano_layer=self.hand_mano_layer,
+        )
+
+    def _build_hand_pose_head(self):
+        return HandPoseHead(
+            self.hand_hamer_cfg,
+            in_dim=self.local_task_dim,
+            hidden_dim=self.local_task_dim,
+            patch_h=self.hand_task_patch_h,
+            patch_w=self.hand_task_patch_w,
         )
 
     def _encode_hands(
         self,
         imgs: torch.Tensor,
         hand_masks: torch.Tensor | None,
-        hand_owner_index: torch.Tensor | None,
         hand_is_right: torch.Tensor | None,
     ) -> dict[str, torch.Tensor | None]:
-        if hand_masks is None and hand_owner_index is None and hand_is_right is None:
+        if hand_masks is None and hand_is_right is None:
             return {
-                "hand_queries": None,
+                "hand_tokens": None,
                 "hand_betas": None,
-                "hand_masks": None,
-                "hand_owner_index": None,
+                "hand_valid_mask": None,
                 "hand_is_right": None,
             }
-        if hand_masks is None or hand_owner_index is None or hand_is_right is None:
-            raise ValueError("hand_masks, hand_owner_index, and hand_is_right must be provided together")
+        if hand_masks is None or hand_is_right is None:
+            raise ValueError("hand_masks and hand_is_right must be provided together")
         if self.hand_encoder is None:
             return {
-                "hand_queries": None,
+                "hand_tokens": None,
                 "hand_betas": None,
-                "hand_masks": None,
-                "hand_owner_index": None,
+                "hand_valid_mask": None,
                 "hand_is_right": None,
-            }
-        if hand_masks.shape[0] == 0:
-            return {
-                "hand_queries": imgs.new_zeros((0, int(getattr(self.hand_encoder, "output_dim", self.dec_embed_dim)))),
-                "hand_betas": imgs.new_zeros((0, 10)),
-                "hand_masks": hand_masks,
-                "hand_owner_index": hand_owner_index,
-                "hand_is_right": hand_is_right,
             }
 
         with torch.no_grad():
             hand_encoder_out = self.hand_encoder(
                 imgs,
                 hand_masks,
-                hand_owner_index,
                 hand_is_right,
             )
 
-        hand_queries = hand_encoder_out["hand_queries"]
-        hand_betas = hand_encoder_out.get("hand_betas", imgs.new_zeros((hand_queries.shape[0], 10)))
-        if hand_queries.shape[0] == 0:
-            hand_masks = hand_masks[:0]
-        else:
-            valid_source_index = hand_encoder_out.get("source_index", None)
-            if valid_source_index is not None:
-                hand_masks = hand_masks.index_select(0, valid_source_index)
-
         return {
-            "hand_queries": hand_queries,
-            "hand_betas": hand_betas,
-            "hand_masks": hand_masks,
-            "hand_owner_index": hand_encoder_out["owner_index"],
+            "hand_tokens": hand_encoder_out["hand_tokens"],
+            "hand_betas": hand_encoder_out.get("hand_betas", imgs.new_zeros((*imgs.shape[:2], 10))),
+            "hand_valid_mask": hand_encoder_out["hand_valid_mask"],
             "hand_is_right": hand_encoder_out["hand_is_right"],
         }
 
@@ -466,7 +501,6 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         mask_add_ray=None,
         mask_add_pose=None,
         hand_masks=None,
-        hand_owner_index=None,
         hand_is_right=None,
         object_masks=None,
         object_valid=None,
@@ -507,9 +541,21 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         B, N, _, H, W = imgs.shape
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
 
-        if object_multiview is not None:
-            if object_masks is None or object_valid is None:
-                raise ValueError("object_masks and object_valid are required when object_multiview is provided")
+        omv_meta = None
+
+        # ---- ho_mode: hand / object / OMV are bound — all present or all absent ----
+        _has_hand = hand_masks is not None and hand_is_right is not None
+        _has_obj = object_masks is not None and object_valid is not None
+        _has_omv = object_multiview is not None
+        if _has_hand != _has_obj or _has_hand != _has_omv:
+            raise ValueError(
+                "hand_masks, object_masks/object_valid, and object_multiview "
+                "must be all present or all absent. "
+                f"Got hand={_has_hand}, object={_has_obj}, omv={_has_omv}"
+            )
+        ho_mode = _has_hand
+
+        if ho_mode:
             required = ["img", "depthmap", "camera_intrinsics", "camera_pose"]
             missing = [key for key in required if key not in object_multiview]
             if missing:
@@ -529,51 +575,49 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         )
         rgb_patch_tokens = rgb_patch_tokens.reshape(B, N, -1, self.dec_embed_dim)
         hidden = hidden.reshape(B, N, -1, self.dec_embed_dim)
-        hidden_prep = self.decode_prepare(hidden, N, H, W, poses_, use_pose_mask)
+        hidden_prep = self.decode_prepare(
+            hidden,
+            N,
+            H,
+            W,
+            poses_,
+            use_pose_mask,
+            enable_pose_prepare=self.use_multimodal,
+        )
 
         hand_encoder_outputs = self._encode_hands(
             imgs,
             hand_masks=hand_masks,
-            hand_owner_index=hand_owner_index,
             hand_is_right=hand_is_right,
         )
-        hand_queries = hand_encoder_outputs["hand_queries"]
+        hand_hamer_tokens = hand_encoder_outputs["hand_tokens"]
         hand_betas = hand_encoder_outputs["hand_betas"]
-        hand_masks = hand_encoder_outputs["hand_masks"]
-        hand_owner_index = hand_encoder_outputs["hand_owner_index"]
+        hand_valid_mask = hand_encoder_outputs["hand_valid_mask"]
         hand_is_right = hand_encoder_outputs["hand_is_right"]
 
         hand_adapter_outputs = None
-        num_hand_tokens = 0
-        if hand_queries is not None:
+        if ho_mode:
             hand_adapter_outputs = self.hand_token_adapter(
-                rgb_patch_tokens,
-                hand_queries,
+                imgs,
                 hand_masks,
-                hand_owner_index,
                 hand_is_right,
-                image_hw=(H, W),
-                hand_betas=hand_betas,
+                self.encoder,
             )
-            num_hand_tokens = hand_adapter_outputs["num_hand_tokens"]
 
         object_adapter_outputs = None
-        if object_multiview is not None:
+        if ho_mode:
             object_adapter_outputs = self.object_query_adapter(
-                rgb_patch_tokens,
+                imgs,
                 object_masks,
                 object_valid,
-                image_hw=(H, W),
+                self.encoder,
             )
-            if object_adapter_outputs["object_query"].shape[2] != 1:
-                raise ValueError(
-                    f"Pi3X object branch expects exactly one object token, "
-                    f"got {object_adapter_outputs['object_query'].shape[2]}"
-                )
 
+        if ho_mode:
             obj_imgs = object_multiview["img"]
             obj_B, obj_N, _, obj_H, obj_W = obj_imgs.shape
             assert obj_B == B
+            obj_imgs = (obj_imgs - self.image_mean.to(device=obj_imgs.device, dtype=obj_imgs.dtype)) / self.image_std.to(device=obj_imgs.device, dtype=obj_imgs.dtype)
             obj_depths = object_multiview["depthmap"] if self.use_multimodal else None
             obj_intrinsics = object_multiview["camera_intrinsics"] if self.use_multimodal else None
             obj_poses = object_multiview["camera_pose"]
@@ -588,22 +632,70 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
             )
             obj_hidden = obj_hidden.reshape(obj_B, obj_N, -1, self.dec_embed_dim)
             obj_use_pose_mask = torch.ones((obj_B, obj_N), dtype=torch.bool, device=obj_imgs.device)
-            obj_hidden_prep = self.decode_prepare(obj_hidden, obj_N, obj_H, obj_W, obj_poses_, obj_use_pose_mask)
+            obj_hidden_prep = self.decode_prepare(
+                obj_hidden,
+                obj_N,
+                obj_H,
+                obj_W,
+                obj_poses_,
+                obj_use_pose_mask,
+                enable_pose_prepare=self.use_multimodal,
+            )
+            omv_meta = (obj_N, obj_H, obj_W)
+
+        fused_hand_outputs = None
+        if ho_mode:
+            hand_dino_tokens = hand_adapter_outputs["hand_tokens"]
+            if hand_hamer_tokens.shape[:3] != hand_dino_tokens.shape[:3]:
+                raise ValueError(
+                    "HaMeR and DINO hand token batch/view/token dimensions must match, "
+                    f"got {tuple(hand_hamer_tokens.shape)} vs {tuple(hand_dino_tokens.shape)}"
+                )
+            fused_hand_outputs = {
+                "hand_tokens": self.hand_token_fuse(torch.cat([hand_hamer_tokens, hand_dino_tokens], dim=-1)),
+                "hand_valid_mask": hand_valid_mask & hand_adapter_outputs["hand_valid_mask"],
+            }
+
+        prepared_hand_hidden = None
+        if ho_mode:
+            hand_crop_h, hand_crop_w = tuple(getattr(self.hand_token_adapter, "crop_hw"))
+            prepared_hand_state = self.decode_prepare(
+                fused_hand_outputs["hand_tokens"],
+                N,
+                hand_crop_h,
+                hand_crop_w,
+                enable_pose_prepare=False,
+            )
+            prepared_hand_tokens, _, prepared_hand_pos, _, _, _, _, _, _ = prepared_hand_state
+            prepared_hand_hidden = (
+                prepared_hand_tokens.reshape(B, N, -1, self.dec_embed_dim),
+                prepared_hand_pos.reshape(B, N, -1, 2),
+                fused_hand_outputs["hand_valid_mask"],
+            )
+
+        prepared_object_hidden = None
+        if ho_mode:
+            object_crop_h, object_crop_w = tuple(getattr(self.object_query_adapter, "crop_hw"))
+            prepared_object_state = self.decode_prepare(
+                object_adapter_outputs["object_tokens"],
+                N,
+                object_crop_h,
+                object_crop_w,
+                enable_pose_prepare=False,
+            )
+            prepared_object_tokens, _, prepared_object_pos, _, _, _, _, _, _ = prepared_object_state
+            prepared_object_hidden = (
+                prepared_object_tokens.reshape(B, N, -1, self.dec_embed_dim),
+                prepared_object_pos.reshape(B, N, -1, 2),
+                object_adapter_outputs["object_valid_mask"],
+                obj_hidden_prep,
+            )
 
         # decode
-        hidden, pos, hand_features, object_features = self.decode(
+        hidden, pos, hand_features, object_features, omv_features, omv_pos = self.decode(
             hidden_prep,
-            object_hidden=None if object_adapter_outputs is None else (
-                object_adapter_outputs["object_query"],
-                object_adapter_outputs["object_query_pos"],
-                object_adapter_outputs["object_valid"],
-                obj_hidden_prep,
-            ),
-            hand_hidden=None if hand_adapter_outputs is None else (
-                hand_adapter_outputs["dense_tokens"],
-                hand_adapter_outputs["dense_pos"],
-                hand_adapter_outputs["dense_valid_mask"],
-            ),
+            object_hidden=prepared_object_hidden,
+            hand_hidden=prepared_hand_hidden,
         )
 
         # # head
@@ -611,55 +703,27 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         scene_hidden_out = hidden[:, :scene_total_tokens, :]
         scene_pos = pos[:, :scene_total_tokens, :]
         outputs = self.forward_head(scene_hidden_out, scene_pos, B, N, H, W, patch_h, patch_w, num_hand_tokens=0)
+        outputs.update(
+            self.forward_ho_head(
+                B=B,
+                N=N,
+                hand_features=hand_features,
+                object_features=object_features,
+                prepared_hand_hidden=prepared_hand_hidden,
+                prepared_object_hidden=prepared_object_hidden,
+                fused_hand_outputs=fused_hand_outputs,
+                object_adapter_outputs=object_adapter_outputs,
+                hand_is_right=hand_is_right,
+                hand_betas=hand_betas,
+            )
+        )
 
-        if hand_adapter_outputs is not None and num_hand_tokens > 0 and hand_features is not None:
-            dense_hand_features = hand_features.reshape(B, N, num_hand_tokens, -1)
-            dense_hand_betas = hand_adapter_outputs["dense_betas"]
-            sparse_hand_features = []
-            sparse_hand_betas = []
-            for idx in range(hand_owner_index.shape[0]):
-                b_idx, n_idx, m_idx = hand_owner_index[idx].tolist()
-                sparse_hand_features.append(dense_hand_features[b_idx, n_idx, m_idx])
-                sparse_hand_betas.append(dense_hand_betas[b_idx, n_idx, m_idx])
-            if sparse_hand_features:
-                sparse_hand_features = torch.stack(sparse_hand_features, dim=0)
-                sparse_hand_betas = torch.stack(sparse_hand_betas, dim=0)
-                hand_outputs = self.hand_mano_head(sparse_hand_features, hand_is_right=hand_is_right, hand_betas=sparse_hand_betas)
-                outputs["pred_hand_mano_params"] = hand_outputs["pred_mano_params"]
-                outputs["pred_hand_mano_betas"] = hand_outputs["pred_hand_mano_betas"]
-                outputs["pred_hand_transl_dir"] = hand_outputs["pred_hand_transl_dir"]
-                outputs["pred_hand_transl_log_scale"] = hand_outputs["pred_hand_transl_log_scale"]
-                outputs["pred_hand_transl_scale"] = hand_outputs["pred_hand_transl_scale"]
-                outputs["pred_hand_transl"] = hand_outputs["pred_hand_transl"]
-                outputs["pred_hand_log_scale"] = hand_outputs["pred_hand_log_scale"]
-                outputs["pred_hand_scale"] = hand_outputs["pred_hand_scale"]
-                if "pred_hand_joints_3d" in hand_outputs:
-                    outputs["pred_hand_joints_3d"] = hand_outputs["pred_hand_joints_3d"]
-                if "pred_hand_joints_local" in hand_outputs:
-                    outputs["pred_hand_joints_local"] = hand_outputs["pred_hand_joints_local"]
-                if "pred_hand_vertices" in hand_outputs:
-                    outputs["pred_hand_vertices"] = hand_outputs["pred_hand_vertices"]
-                if "pred_hand_vertices_local" in hand_outputs:
-                    outputs["pred_hand_vertices_local"] = hand_outputs["pred_hand_vertices_local"]
-                outputs["hand_owner_index"] = hand_owner_index
-                outputs["hand_is_right"] = hand_is_right
-                outputs["hand_token_features"] = sparse_hand_features
-
-        if object_adapter_outputs is not None and object_features is not None:
-            if object_features.shape[1] != 1:
-                raise ValueError(
-                    f"Pi3X object branch expects a single object feature token, got {object_features.shape[1]}"
-                )
-            object_query_feat = object_features.reshape(B, N, -1)
-            object_pose = self.object_pose_head(object_query_feat)
-            outputs["pred_object_rot6d"] = object_pose["rot6d"]
-            outputs["pred_object_transl_dir"] = object_pose["trans_dir"]
-            outputs["pred_object_transl_log_scale"] = object_pose["trans_log_scale"]
-            outputs["pred_object_transl_scale"] = object_pose["trans_scale"]
-            outputs["pred_object_trans"] = object_pose["trans"]
-            outputs["pred_object_log_scale"] = object_pose["log_scale"]
-            outputs["pred_object_scale"] = object_pose["scale"]
-            outputs["object_valid"] = object_valid
+        # OMV point and camera heads
+        if ho_mode:
+            N_omv, H_omv, W_omv = omv_meta
+            outputs["omv_local_points"], outputs["omv_camera_poses"] = self._forward_omv_head(
+                omv_features, omv_pos, B, N_omv, H_omv, W_omv,
+            )
 
         return outputs
     
@@ -791,6 +855,40 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
             return [torch.cat(parts, dim=0) for parts in outputs]
         return torch.cat(outputs, dim=0)
 
+    def _forward_omv_head(self, omv_features, omv_pos, B, N_omv, H_omv, W_omv):
+        patch_h = H_omv // self.patch_size
+        patch_w = W_omv // self.patch_size
+        num_patch_tokens = patch_h * patch_w
+        patch_slice = slice(self.patch_start_idx, self.patch_start_idx + num_patch_tokens)
+
+        ret_point = self.omv_point_decoder(omv_features, xpos=omv_pos)
+        ret_camera = self.omv_camera_decoder(omv_features, xpos=omv_pos)
+
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            # point
+            point_feat = ret_point[:, patch_slice].float()
+            xy, z = self._chunked_conv_head(self.omv_point_head, point_feat, patch_h, patch_w)
+            # ConvHead always upscales to (patch_h*14, patch_w*14);
+            # interpolate to the actual (H_omv, W_omv) if they differ.
+            if xy.shape[-2:] != (H_omv, W_omv):
+                xy = nn.functional.interpolate(
+                    xy, (H_omv, W_omv), mode='bilinear', align_corners=False,
+                )
+                z = nn.functional.interpolate(
+                    z, (H_omv, W_omv), mode='bilinear', align_corners=False,
+                )
+            xy = xy.permute(0, 2, 3, 1).reshape(B, N_omv, H_omv, W_omv, -1)
+            z = z.permute(0, 2, 3, 1).reshape(B, N_omv, H_omv, W_omv, -1)
+            z = torch.exp(z.clamp(max=15.0))
+            local_points = torch.cat([xy * z, z], dim=-1)
+
+            # camera
+            camera_poses = self.omv_camera_head(
+                ret_camera[:, patch_slice].float(), patch_h, patch_w,
+            ).reshape(B, N_omv, 4, 4)
+
+        return local_points, camera_poses
+
     def forward_head(self, hidden, pos, B, N, H, W, patch_h, patch_w, num_hand_tokens=0):
         device = hidden.device
         num_patch_tokens = patch_h * patch_w
@@ -849,9 +947,102 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
             metric=metric,
         )
 
-    def decode_prepare(self, hidden, N, H, W, poses, use_pose_mask):
-        device = hidden.device
+    def forward_ho_head(
+        self,
+        *,
+        B,
+        N,
+        hand_features=None,
+        object_features=None,
+        prepared_hand_hidden=None,
+        prepared_object_hidden=None,
+        fused_hand_outputs=None,
+        object_adapter_outputs=None,
+        hand_is_right=None,
+        hand_betas=None,
+    ):
+        outputs = {}
 
+        if fused_hand_outputs is not None:
+            dense_hand_features = hand_features.reshape(B, N, prepared_hand_hidden[0].shape[2], -1)
+            dense_hand_pos = prepared_hand_hidden[1]
+            hand_global_decoded = self.hand_global_decoder(
+                dense_hand_features.reshape(B * N, dense_hand_features.shape[2], dense_hand_features.shape[3]),
+                xpos=dense_hand_pos.reshape(B * N, dense_hand_pos.shape[2], dense_hand_pos.shape[3]),
+            ).reshape(B, N, dense_hand_features.shape[2], self.local_task_dim)
+            hand_pose_decoded = self.hand_pose_decoder(
+                dense_hand_features.reshape(B * N, dense_hand_features.shape[2], dense_hand_features.shape[3]),
+                xpos=dense_hand_pos.reshape(B * N, dense_hand_pos.shape[2], dense_hand_pos.shape[3]),
+            ).reshape(B, N, dense_hand_features.shape[2], self.local_task_dim)
+            hand_global_patch_tokens = hand_global_decoded[:, :, self.patch_start_idx:, :]
+            hand_pose_patch_tokens = hand_pose_decoded[:, :, self.patch_start_idx:, :]
+
+            with torch.amp.autocast(device_type='cuda', enabled=False):
+                dense_hand_global_outputs = self.hand_global_head(
+                    hand_global_patch_tokens.float(),
+                    valid_mask=fused_hand_outputs["hand_valid_mask"],
+                )
+                dense_hand_pose_outputs = self.hand_pose_head(
+                    hand_pose_patch_tokens.float(),
+                    valid_mask=fused_hand_outputs["hand_valid_mask"],
+                )
+                dense_hand_outputs = self.hand_mano_head(
+                    hand_pose=dense_hand_pose_outputs["pred_hand_pose"].reshape(B * N, self.hand_num_joints, 3, 3),
+                    hand_is_right=hand_is_right.reshape(B * N),
+                    hand_betas=hand_betas.reshape(B * N, -1).float(),
+                    global_orient=dense_hand_global_outputs["pred_hand_global_orient"].reshape(B * N, 1, 3, 3),
+                    transl=dense_hand_global_outputs["pred_hand_transl"].reshape(B * N, -1),
+                    scale=dense_hand_global_outputs["pred_hand_scale"].reshape(B * N, -1),
+                )
+
+            outputs["pred_hand_mano_params"] = {
+                key: value.reshape(B, N, *value.shape[1:]) for key, value in dense_hand_outputs["pred_mano_params"].items()
+            }
+            outputs["pred_hand_mano_betas"] = dense_hand_outputs["pred_hand_mano_betas"].reshape(B, N, -1)
+            outputs["pred_hand_joints_3d"] = dense_hand_outputs["pred_hand_joints_3d"].reshape(B, N, -1, 3)
+            outputs["pred_hand_vertices"] = dense_hand_outputs["pred_hand_vertices"].reshape(B, N, -1, 3)
+            outputs["pred_hand_joints_local"] = dense_hand_outputs["pred_hand_joints_local"].reshape(B, N, -1, 3)
+            outputs["pred_hand_vertices_local"] = dense_hand_outputs["pred_hand_vertices_local"].reshape(B, N, -1, 3)
+            outputs["pred_hand_pose_6d"] = dense_hand_pose_outputs["pred_hand_pose_6d"]
+            outputs["pred_hand_global_orient"] = dense_hand_global_outputs["pred_hand_global_orient"]
+            outputs["pred_hand_global_orient_6d"] = dense_hand_global_outputs["pred_hand_global_orient_6d"]
+            outputs["pred_hand_transl_dir"] = dense_hand_global_outputs["pred_hand_transl_dir"]
+            outputs["pred_hand_transl_log_scale"] = dense_hand_global_outputs["pred_hand_transl_log_scale"]
+            outputs["pred_hand_transl_scale"] = dense_hand_global_outputs["pred_hand_transl_scale"]
+            outputs["pred_hand_transl"] = dense_hand_global_outputs["pred_hand_transl"]
+            outputs["pred_hand_log_scale"] = dense_hand_global_outputs["pred_hand_log_scale"]
+            outputs["pred_hand_scale"] = dense_hand_global_outputs["pred_hand_scale"]
+            outputs["hand_is_right"] = hand_is_right
+            outputs["hand_valid_mask"] = fused_hand_outputs["hand_valid_mask"]
+            outputs["hand_token_features"] = hand_pose_patch_tokens
+
+        if object_adapter_outputs is not None:
+            dense_object_features = object_features.reshape(B, N, prepared_object_hidden[0].shape[2], -1)
+            dense_object_pos = prepared_object_hidden[1]
+            object_pose_decoded = self.object_pose_decoder(
+                dense_object_features.reshape(B * N, dense_object_features.shape[2], dense_object_features.shape[3]),
+                xpos=dense_object_pos.reshape(B * N, dense_object_pos.shape[2], dense_object_pos.shape[3]),
+            ).reshape(B, N, dense_object_features.shape[2], self.local_task_dim)
+            object_patch_tokens = object_pose_decoded[:, :, self.patch_start_idx:, :]
+
+            with torch.amp.autocast(device_type='cuda', enabled=False):
+                object_pose = self.object_pose_head(
+                    object_patch_tokens.float(),
+                    valid_mask=object_adapter_outputs["object_valid_mask"],
+                )
+
+            outputs["pred_object_rot6d"] = object_pose["rot6d"]
+            outputs["pred_object_transl_dir"] = object_pose["trans_dir"]
+            outputs["pred_object_transl_log_scale"] = object_pose["trans_log_scale"]
+            outputs["pred_object_transl_scale"] = object_pose["trans_scale"]
+            outputs["pred_object_trans"] = object_pose["trans"]
+            outputs["pred_object_log_scale"] = object_pose["log_scale"]
+            outputs["pred_object_scale"] = object_pose["scale"]
+            outputs["object_valid"] = object_adapter_outputs["object_valid_mask"]
+
+        return outputs
+
+    def decode_prepare(self, hidden, N, H, W, poses=None, use_pose_mask=None, enable_pose_prepare=True):
         if len(hidden.shape) == 4:
             B, N, hw, _ = hidden.shape
         else:
@@ -874,7 +1065,9 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
             pos_special = torch.zeros(B * N, self.patch_start_idx, 2, device=hidden.device, dtype=pos.dtype)
             pos = torch.cat([pos_special, pos_patch], dim=1)
 
-        if self.use_multimodal:
+        if enable_pose_prepare:
+            if poses is None or use_pose_mask is None:
+                raise ValueError("poses and use_pose_mask are required when enable_pose_prepare=True")
             if use_pose_mask.sum() == B * N:
                 pose_inject_mask = None
             else:
@@ -891,32 +1084,33 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         B = BN // N
 
         hand_tokens = hand_pos = None
-        object_token = object_pos = None
+        object_tokens = object_pos = None
         hidden_omv = pos_omv = poses_omv = use_pose_mask_omv = pose_inject_mask_omv = None
         N_omv = H_omv = W_omv = 0
         hw_omv = 0
         num_hand_tokens = 0
+        num_object_tokens = 0
 
         if hand_hidden is not None:
             hand_tokens, hand_pos, hand_valid = hand_hidden
             if hand_tokens is not None and hand_tokens.shape[:2] != (B, N):
                 raise ValueError("hand_tokens must align with scene batch/view dimensions")
             num_hand_tokens = 0 if hand_tokens is None else hand_tokens.shape[2]
-            hand_valid = hand_valid.unsqueeze(-1)
+            hand_valid = hand_valid.unsqueeze(-1).unsqueeze(-1)
 
         if object_hidden is not None:
-            object_token, object_pos, object_valid, object_state = object_hidden
-            if object_token.shape[:2] != (B, N):
-                raise ValueError("object_token must align with scene batch/view dimensions")
-            if object_token.shape[2] != 1:
-                raise ValueError(f"decode expects a single object token, got {object_token.shape[2]}")
+            object_tokens, object_pos, object_valid, object_state = object_hidden
+            if object_tokens.shape[:2] != (B, N):
+                raise ValueError("object_tokens must align with scene batch/view dimensions")
+            num_object_tokens = object_tokens.shape[2]
             hidden_omv, N_omv, pos_omv, poses_omv, use_pose_mask_omv, pose_inject_mask_omv, H_omv, W_omv, _ = object_state
             _, hw_omv, _ = hidden_omv.shape
             object_valid = object_valid.unsqueeze(-1).unsqueeze(-1)
 
         temp_features = hidden.clone()
         temp_hand = hand_tokens.clone() if hand_tokens is not None else None
-        temp_object = object_token.clone() if object_token is not None else None
+        temp_object = object_tokens.clone() if object_tokens is not None else None
+        temp_omv = None
 
         for i, blk in enumerate(self.decoder):
             ho_blk = self.ho_decoder[i]
@@ -928,45 +1122,49 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
                     hidden_omv = hidden_omv.reshape(B * N_omv, hw_omv, -1)
                     pos_omv = pos_omv.reshape(B * N_omv, hw_omv, -1)
 
-                # ho
-                ho_tokens = []
-                ho_pos = []
+                # hand + object cross-attn with scene — ho_mode guarantees both present together
                 if hand_tokens is not None:
-                    ho_tokens.append(hand_tokens.reshape(B * N, num_hand_tokens, -1))
-                    ho_pos.append(hand_pos.reshape(B * N, num_hand_tokens, -1).to(hidden.device).to(pos.dtype) + 1)
-                if object_token is not None:
-                    ho_tokens.append(object_token.reshape(B * N, 1, -1))
-                    ho_pos.append(object_pos.reshape(B * N, 1, -1).to(hidden.device).to(pos.dtype) + 1)
-                if ho_tokens:
                     prev_hand_tokens = hand_tokens
-                    prev_object_token = object_token
-                    ho_seq = torch.cat(ho_tokens, dim=1)
-                    ho_pos_seq = torch.cat(ho_pos, dim=1)
+                    prev_object_tokens = object_tokens
+                    hand_seq = hand_tokens.reshape(B * N, num_hand_tokens, -1)
+                    object_seq = object_tokens.reshape(B * N, num_object_tokens, -1)
+                    hand_pos_view = hand_pos.reshape(B * N, num_hand_tokens, -1).to(hidden.device).to(pos.dtype) + 1
+                    object_pos_view = object_pos.reshape(B * N, num_object_tokens, -1).to(hidden.device).to(pos.dtype) + 1
+                    ho_seq = torch.cat([hand_seq, object_seq], dim=1)
+                    ho_pos_view = torch.cat([hand_pos_view, object_pos_view], dim=1)
+                    hand_alpha = self.ho_hand_scene_cross_alpha[i].to(dtype=ho_seq.dtype, device=ho_seq.device)
+                    object_alpha = self.ho_object_scene_cross_alpha[i].to(dtype=ho_seq.dtype, device=ho_seq.device)
+                    cross_alpha = torch.cat(
+                        [
+                            hand_alpha.reshape(1, 1, 1).expand(1, num_hand_tokens, 1),
+                            object_alpha.reshape(1, 1, 1).expand(1, num_object_tokens, 1),
+                        ],
+                        dim=1,
+                    )
                     ho_seq = ho_blk(
                         ho_seq,
                         hidden,
-                        xpos=ho_pos_seq,
+                        xpos=ho_pos_view,
                         ypos=pos,
                         enable_self_attn=True,
                         enable_cross_attn=True,
+                        cross_alpha=cross_alpha,
                     )
-
-                    offset = 0
-                    # 用于禁止占位token的更新
-                    if hand_tokens is not None:
-                        hand_seq = ho_seq[:, offset:offset + num_hand_tokens].reshape(B, N, num_hand_tokens, -1)
-                        hand_tokens = torch.where(hand_valid, hand_seq, prev_hand_tokens)
-                        offset += num_hand_tokens
-                    if object_token is not None:
-                        object_seq = ho_seq[:, offset:offset + 1].reshape(B, N, 1, -1)
-                        object_token = torch.where(object_valid, object_seq, prev_object_token)
+                    hand_seq, object_seq = torch.split(ho_seq, [num_hand_tokens, num_object_tokens], dim=1)
+                    hand_tokens = torch.where(hand_valid, hand_seq.reshape(B, N, num_hand_tokens, -1), prev_hand_tokens)
+                    object_tokens = torch.where(object_valid, object_seq.reshape(B, N, num_object_tokens, -1), prev_object_tokens)
 
                 # scene
                 hidden = blk(hidden, xpos=pos)
 
-                # object multiview
+                # object multiview — route through ho_decoder (self-attn only)
                 if hidden_omv is not None:
-                    hidden_omv = blk(hidden_omv, xpos=pos_omv)
+                    hidden_omv = ho_blk(
+                        hidden_omv, None,
+                        xpos=pos_omv, ypos=None,
+                        enable_self_attn=True,
+                        enable_cross_attn=False,
+                    )
 
             else:
                 hidden = hidden.reshape(B, N * hw, -1)
@@ -974,7 +1172,7 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
                 if hidden_omv is not None:
                     hidden_omv = hidden_omv.reshape(B, N_omv * hw_omv, -1)
                     pos_omv = pos_omv.reshape(B, N_omv * hw_omv, -1)
-                # ho
+                # hand self-attn
                 if hand_tokens is not None:
                     prev_hand_tokens = hand_tokens
                     hand_seq = hand_tokens.reshape(B, N * num_hand_tokens, -1)
@@ -993,42 +1191,36 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
                         prev_hand_tokens,
                     )
 
-                if object_token is not None:
-                    prev_object_token = object_token
-                    object_seq = object_token.reshape(B, N, -1)
-                    object_pos_global = torch.zeros(B, N, 2, device=object_seq.device, dtype=pos.dtype)
-                    if hidden_omv is not None:
-                        object_memory = hidden_omv[..., self.patch_start_idx:, :]
-                        object_memory_pos = pos_omv[..., self.patch_start_idx:, :]
-                        object_seq = ho_blk(
-                            object_seq,
-                            object_memory,
-                            xpos=object_pos_global,
-                            ypos=object_memory_pos,
-                            enable_self_attn=True,
-                            enable_cross_attn=True,
-                        )
-                    else:
-                        object_seq = ho_blk(
-                            object_seq,
-                            None,
-                            xpos=object_pos_global,
-                            ypos=None,
-                            enable_self_attn=True,
-                            enable_cross_attn=False,
-                        )
-                    object_token = torch.where(
+                # object + OMV self-attn — ho_mode guarantees both present together
+                if object_tokens is not None:
+                    prev_object_tokens = object_tokens
+                    object_seq = object_tokens.reshape(B, N * num_object_tokens, -1)
+                    object_pos_global = torch.zeros(B, N * num_object_tokens, 2, device=object_seq.device, dtype=pos.dtype)
+                    omv_seq = hidden_omv.reshape(B, N_omv * hw_omv, -1)
+                    omv_pos_global = pos_omv.reshape(B, N_omv * hw_omv, -1)
+
+                    merged_seq = torch.cat([object_seq, omv_seq], dim=1)
+                    merged_pos = torch.cat([object_pos_global, omv_pos_global], dim=1)
+
+                    merged_out = ho_blk(
+                        merged_seq, None,
+                        xpos=merged_pos, ypos=None,
+                        enable_self_attn=True,
+                        enable_cross_attn=False,
+                    )
+
+                    n_obj = N * num_object_tokens
+                    object_seq = merged_out[:, :n_obj, :]
+                    hidden_omv = merged_out[:, n_obj:, :]
+
+                    object_tokens = torch.where(
                         object_valid,
-                        object_seq.reshape(B, N, 1, -1),
-                        prev_object_token,
+                        object_seq.reshape(B, N, num_object_tokens, -1),
+                        prev_object_tokens,
                     )
 
                 # scene
                 hidden = blk(hidden, xpos=pos)
-
-                # object multiview
-                if hidden_omv is not None:
-                    hidden_omv = blk(hidden_omv, xpos=pos_omv)
 
             if self.use_multimodal and i in [1, 9, 17, 25, 33]:
                 if use_pose_mask.sum() > 0:
@@ -1070,17 +1262,30 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
                 temp_features = hidden.clone().reshape(B * N, hw, -1)
                 if hand_tokens is not None:
                     temp_hand = hand_tokens.clone()
-                if object_token is not None:
-                    temp_object = object_token.clone()
+                if object_tokens is not None:
+                    temp_object = object_tokens.clone()
+                if hidden_omv is not None:
+                    temp_omv = hidden_omv.clone()
 
         scene_concat = torch.cat((temp_features, hidden.reshape(B * N, hw, -1)), dim=-1)
         hand_concat = None
         object_concat = None
         if hand_tokens is not None:
             hand_concat = torch.cat((temp_hand, hand_tokens), dim=-1).reshape(B * N, num_hand_tokens, -1)
-        if object_token is not None:
-            object_concat = torch.cat((temp_object, object_token), dim=-1).reshape(B * N, 1, -1)
-        return scene_concat, pos.reshape(B * N, hw, -1), hand_concat, object_concat
+        if object_tokens is not None:
+            object_concat = torch.cat((temp_object, object_tokens), dim=-1).reshape(B * N, num_object_tokens, -1)
+
+        omv_concat = None
+        omv_pos_out = None
+        if hidden_omv is not None and temp_omv is not None:
+            omv_concat = torch.cat(
+                (temp_omv.reshape(B * N_omv, hw_omv, -1),
+                 hidden_omv.reshape(B * N_omv, hw_omv, -1)),
+                dim=-1,
+            )
+            omv_pos_out = pos_omv.reshape(B * N_omv, hw_omv, -1)
+
+        return scene_concat, pos.reshape(B * N, hw, -1), hand_concat, object_concat, omv_concat, omv_pos_out
     
     def normalize_depth(self, depths: torch.Tensor, method: str = 'median') -> tuple[torch.Tensor, torch.Tensor]:
         """

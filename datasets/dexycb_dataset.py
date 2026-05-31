@@ -11,6 +11,8 @@ from .base.transforms import *
 import pi3.utils.cropping as cropping
 from pi3.utils.geometry import depthmap_to_absolute_camera_coordinates
 from pi3.utils.projection import load_obj_vertices, map_points_between_intrinsics
+from pi3.models.hamer.config import get_config as get_hamer_config, resolve_mano_path_template
+from pi3.models.hamer.mano_layer import build_mano_layer_pair
 
 
 _YCB_CLASSES = {
@@ -36,6 +38,8 @@ _YCB_CLASSES = {
     20: "052_extra_large_clamp",
     21: "061_foam_brick",
 }
+
+_IMAGENET_MEAN_RGB = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 
 
 class DexYCBDataset(BaseDataset):
@@ -95,6 +99,7 @@ class DexYCBDataset(BaseDataset):
         self.object_multiview_cache = {}
         self.object_model_index = self._build_object_model_index()
         self.object_vertices_cache = {}
+        self.hand_pose_decoder = None
 
         self.tracks = self._build_tracks()
         self.sequences = self.tracks
@@ -189,6 +194,46 @@ class DexYCBDataset(BaseDataset):
         vertices = load_obj_vertices(obj_path)
         self.object_vertices_cache[object_id] = vertices
         return vertices
+
+    def _default_hamer_paths(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        config_file = repo_root / "configs" / "hamer" / "model_config.yaml"
+        cache_dir = repo_root / "data" / "model" / "hamer" / "_DATA"
+        return config_file, cache_dir
+
+    def _get_hand_pose_decoder(self):
+        if self.hand_pose_decoder is not None:
+            return self.hand_pose_decoder
+        config_file, cache_dir = self._default_hamer_paths()
+        hamer_cfg = get_hamer_config(str(config_file), merge=True, cache_dir=str(cache_dir), update_cachedir=True)
+        mano_cfg = {key.lower(): value for key, value in dict(hamer_cfg.MANO).items()}
+        mano_data_dir = mano_cfg.get("data_dir", None)
+        mano_cfg["model_path"] = resolve_mano_path_template(mano_cfg.get("model_path"), mano_data_dir)
+        mano_root = Path(mano_cfg["model_path"])
+        if mano_root.is_file():
+            mano_root = mano_root.parent
+        self.hand_pose_decoder = build_mano_layer_pair(
+            mano_root=str(mano_root),
+            flat_hand_mean=mano_cfg.get("flat_hand_mean", False),
+            ncomps=mano_cfg.get("ncomps", 45),
+            use_pca=mano_cfg.get("use_pca", True),
+            center_idx=mano_cfg.get("center_idx", None),
+            root_rot_mode=mano_cfg.get("root_rot_mode", "axisang"),
+            joint_rot_mode=mano_cfg.get("joint_rot_mode", "axisang"),
+            robust_rot=mano_cfg.get("robust_rot", False),
+        )
+        return self.hand_pose_decoder
+
+    def _decode_hand_pose_gt_rotmats(self, pose_mano, mano_side):
+        decoder = self._get_hand_pose_decoder()
+        layer = decoder["right" if mano_side == "right" else "left"]
+        pose_tensor = torch.as_tensor(pose_mano, dtype=torch.float32).reshape(1, -1)
+        with torch.no_grad():
+            global_orient, hand_pose = layer.decode_pose_coeffs_to_rotmat(pose_tensor)
+        return (
+            global_orient[0].detach().cpu().numpy().astype(np.float32),
+            hand_pose[0].detach().cpu().numpy().astype(np.float32),
+        )
 
     def _load_mano_betas(self, mano_calib):
         if mano_calib in self.mano_cache:
@@ -369,6 +414,8 @@ class DexYCBDataset(BaseDataset):
         view_count = intrinsics.shape[0]
         color_files = [bundle_dir / f"color_{view_idx:06d}.jpg" for view_idx in range(view_count)]
         depth_files = [bundle_dir / f"aligned_depth_to_color_{view_idx:06d}.png" for view_idx in range(view_count)]
+        mask_files = [bundle_dir / f"mask_{view_idx:06d}.png" for view_idx in range(view_count)]
+        mask_files = [f for f in mask_files if f.is_file()] or []
         for color_file, depth_file in zip(color_files, depth_files):
             if not color_file.is_file() or not depth_file.is_file():
                 raise FileNotFoundError(
@@ -380,6 +427,7 @@ class DexYCBDataset(BaseDataset):
             "bundle_dir": bundle_dir,
             "color_files": color_files,
             "depth_files": depth_files,
+            "mask_files": mask_files,
             "camera_intrinsics": intrinsics,
             "camera_pose": camera_pose,
             "normalization_center": normalization_center,
@@ -406,16 +454,29 @@ class DexYCBDataset(BaseDataset):
         depthmaps = []
         pts3d_all = [] if include_pts3d else None
 
-        for color_file, depth_file, intrinsics, camera_pose in zip(
+        mask_files = bundle.get("mask_files", [])
+        for idx, (color_file, depth_file, intrinsics, camera_pose) in enumerate(zip(
             bundle["color_files"],
             bundle["depth_files"],
             bundle["camera_intrinsics"],
             bundle["camera_pose"],
-        ):
+        )):
             image = self._load_rgb_pil(color_file)
-            imgs.append(self.transform(image))
+            image = self.transform(image)
 
             depthmap = cv2.imread(str(depth_file), cv2.IMREAD_ANYDEPTH).astype(np.float32) / 1000.0
+            # Fill background pixels with ImageNet mean so that after
+            # normalization the encoder sees a neutral zero signal.
+            if idx < len(mask_files):
+                mask = cv2.imread(str(mask_files[idx]), cv2.IMREAD_GRAYSCALE)
+                bg_mask = torch.from_numpy(np.asarray(mask == 0, dtype=bool))
+            else:
+                # Fallback: pyrender background is exact [0,0,0] in RGB.
+                bg_mask = (image < 2.0 / 255.0).all(dim=0)
+            if bg_mask.any():
+                image[:, bg_mask] = torch.from_numpy(_IMAGENET_MEAN_RGB).view(3, 1)
+
+            imgs.append(image)
             if include_pts3d:
                 pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(
                     depthmap=depthmap,
@@ -455,16 +516,30 @@ class DexYCBDataset(BaseDataset):
             result["pts3d"] = payload["pts3d"]
         return result
 
-    def _build_hand_payload(self, hand_mask, hand_valid, pose_m, joint_3d, joint_2d, mano_betas, mano_side):
+    def _build_hand_payload(
+        self,
+        hand_mask,
+        hand_valid,
+        pose_m,
+        joint_3d,
+        joint_2d,
+        mano_betas,
+        mano_side,
+        global_orient_rotmat_gt,
+        pose_rotmat_gt,
+    ):
         return {
             "mask": hand_mask,
             "valid": hand_valid,
             "pose_mano": pose_m[:48].astype(np.float32),
+            "pose_repr": "mano_pose_coeffs",
             "hand_transl": pose_m[48:51].astype(np.float32),
             "joints_3d_cam": joint_3d.astype(np.float32),
             "joints_2d": joint_2d.astype(np.float32),
             "mano_betas": mano_betas.astype(np.float32),
             "mano_side": mano_side,
+            "global_orient_rotmat_gt": global_orient_rotmat_gt.astype(np.float32),
+            "pose_rotmat_gt": pose_rotmat_gt.astype(np.float32),
         }
 
     def _build_object_payload(
@@ -473,12 +548,14 @@ class DexYCBDataset(BaseDataset):
         object_mask,
         object_valid,
         object_pose,
+        scale_meta,
     ):
         return {
             "grasped_object_id": np.int32(object_id),
             "mask": object_mask.astype(bool),
             "valid": bool(object_valid),
             "pose_obj2cam": object_pose.astype(np.float32),
+            "scale_meta": scale_meta,
         }
 
     def _build_scene_inputs(self, views):
@@ -524,6 +601,12 @@ class DexYCBDataset(BaseDataset):
     def _build_gt_metric(self, views):
         hand_valid = torch.tensor([bool(view["hand"]["valid"]) for view in views], dtype=torch.bool)
         hand_pose_coeffs = torch.stack([torch.as_tensor(view["hand"]["pose_mano"]).float() for view in views], dim=0)
+        hand_global_orient_rotmat_gt = torch.stack(
+            [torch.as_tensor(view["hand"]["global_orient_rotmat_gt"]).float() for view in views], dim=0
+        )
+        hand_pose_rotmat_gt = torch.stack(
+            [torch.as_tensor(view["hand"]["pose_rotmat_gt"]).float() for view in views], dim=0
+        )
         hand_transl = torch.stack([torch.as_tensor(view["hand"]["hand_transl"]).float() for view in views], dim=0)
         hand_mano_betas = torch.stack([torch.as_tensor(view["hand"]["mano_betas"]).float() for view in views], dim=0)
         hand_joints_3d = torch.stack([torch.as_tensor(view["hand"]["joints_3d_cam"]).float() for view in views], dim=0)
@@ -540,6 +623,8 @@ class DexYCBDataset(BaseDataset):
         return {
             "hand_valid": hand_valid,
             "hand_pose_coeffs": hand_pose_coeffs,
+            "hand_global_orient_rotmat_gt": hand_global_orient_rotmat_gt,
+            "hand_pose_rotmat_gt": hand_pose_rotmat_gt,
             "hand_transl": hand_transl,
             "hand_mano_betas": hand_mano_betas,
             "hand_joints_3d": hand_joints_3d,
@@ -553,6 +638,9 @@ class DexYCBDataset(BaseDataset):
             "object_template_vertices": torch.as_tensor(object_multiview_shared["template_vertices"]).float(),
             "object_normalization_center": torch.as_tensor(object_multiview_shared["normalization_center"]).float(),
             "object_normalization_scale": torch.as_tensor(object_multiview_shared["normalization_scale"]).float(),
+            "object_scale_canonical_to_target": torch.stack(
+                [torch.as_tensor(view["object"]["scale_meta"]["canonical_to_target_scale"]).float() for view in views], dim=0
+            ),
         }
 
     def _build_gt_scale_meta(self, views):
@@ -709,6 +797,10 @@ class DexYCBDataset(BaseDataset):
             hand_mask = masks["hand_mask"]
             grasped_object_mask = masks["grasped_object_mask"]
             joint_2d_processed = map_points_between_intrinsics(joint_2d, base_intrinsics, intrinsics)
+            global_orient_rotmat_gt, pose_rotmat_gt = self._decode_hand_pose_gt_rotmats(
+                pose_m[:48],
+                track["mano_side"],
+            )
 
             hand_valid = bool(hand_mask.any()) and bool(np.any(pose_m != 0.0)) and bool(np.any(joint_3d != -1.0))
             grasped_object_valid = bool(grasped_object_mask.any()) and bool(object_pose_valid)
@@ -740,6 +832,11 @@ class DexYCBDataset(BaseDataset):
                 object_mask=grasped_object_mask,
                 object_valid=grasped_object_valid,
                 object_pose=object_pose,
+                scale_meta={
+                    "canonical_to_metric": np.float32(base_object_multiview["normalization_scale"]),
+                    "canonical_to_target_scale": np.float32(base_object_multiview["normalization_scale"]),
+                    "canonical_to_scene_metric": np.float32(base_object_multiview["normalization_scale"]),
+                },
             )
 
             views.append(
@@ -760,6 +857,8 @@ class DexYCBDataset(BaseDataset):
                         joint_2d=joint_2d_processed,
                         mano_betas=mano_betas,
                         mano_side=track["mano_side"],
+                        global_orient_rotmat_gt=global_orient_rotmat_gt,
+                        pose_rotmat_gt=pose_rotmat_gt,
                     ),
                     object=object_payload,
                     object_multiview=object_multiview,

@@ -8,6 +8,39 @@ import torch
 
 from datasets.base.utils import unified_collate_fn
 from trainers.pi3x_trainer import Pi3XTrainer
+from trainers.pi3x_training_policy import apply_pi3x_training_policy
+
+
+def _make_dummy_ho_block() -> torch.nn.Module:
+    """Create a minimal block that mimics HOBlockRope structure for testing."""
+    block = torch.nn.Module()
+    # Self-attention
+    block.attn = torch.nn.Module()
+    block.attn.qkv = torch.nn.Linear(4, 12)
+    block.attn.proj = torch.nn.Linear(4, 4)
+    # Cross-attention
+    block.cross_attn = torch.nn.Module()
+    block.cross_attn.q_proj = torch.nn.Linear(4, 4)
+    block.cross_attn.k_proj = torch.nn.Linear(4, 4)
+    block.cross_attn.v_proj = torch.nn.Linear(4, 4)
+    block.cross_attn.proj = torch.nn.Linear(4, 4)
+    # Norms
+    block.norm1 = torch.nn.LayerNorm(4)
+    block.norm2 = torch.nn.LayerNorm(4)
+    block.norm3 = torch.nn.LayerNorm(4)
+    block.norm_y = torch.nn.LayerNorm(4)
+    # Layer scales
+    block.ls1 = torch.nn.Module()
+    block.ls1.gamma = torch.nn.Parameter(torch.ones(4))
+    block.ls2 = torch.nn.Module()
+    block.ls2.gamma = torch.nn.Parameter(torch.ones(4))
+    block.ls_y = torch.nn.Module()
+    block.ls_y.gamma = torch.nn.Parameter(torch.ones(4))
+    # FFN
+    block.mlp = torch.nn.Module()
+    block.mlp.fc1 = torch.nn.Linear(4, 16)
+    block.mlp.fc2 = torch.nn.Linear(16, 4)
+    return block
 
 
 class _DummyTrainableModule(torch.nn.Module):
@@ -15,14 +48,19 @@ class _DummyTrainableModule(torch.nn.Module):
         super().__init__()
         self.hand_token_adapter = torch.nn.Linear(4, 4)
         self.object_query_adapter = torch.nn.Linear(4, 4)
+        self.hand_global_decoder = torch.nn.Linear(4, 4)
+        self.hand_pose_decoder = torch.nn.Linear(4, 4)
+        self.object_pose_decoder = torch.nn.Linear(4, 4)
+        self.hand_global_head = torch.nn.Linear(4, 4)
+        self.hand_pose_head = torch.nn.Linear(4, 4)
         self.hand_mano_head = torch.nn.Linear(4, 4)
         self.object_pose_head = torch.nn.Linear(4, 4)
+        self.hand_token_fuse = torch.nn.Linear(4, 4)
+        self.ho_hand_scene_cross_alpha = torch.nn.Parameter(torch.zeros(36))
+        self.ho_object_scene_cross_alpha = torch.nn.Parameter(torch.zeros(36))
         self.register_token = torch.nn.Parameter(torch.zeros(1, 1, 4))
         self.metric_token = torch.nn.Parameter(torch.zeros(1, 1, 4))
-        self.ho_decoder = torch.nn.Module()
-        self.ho_decoder.lora_a = torch.nn.Parameter(torch.ones(4, 4))
-        self.ho_decoder.bias = torch.nn.Parameter(torch.zeros(4))
-        self.ho_decoder.norm = torch.nn.LayerNorm(4)
+        self.ho_decoder = torch.nn.ModuleList([_make_dummy_ho_block()])
         self.encoder = torch.nn.Linear(4, 4)
 
 
@@ -32,14 +70,19 @@ class _DummyPi3XModel(torch.nn.Module):
         self.use_multimodal = True
         self.hand_token_adapter = torch.nn.Linear(4, 4)
         self.object_query_adapter = torch.nn.Linear(4, 4)
+        self.hand_global_decoder = torch.nn.Linear(4, 4)
+        self.hand_pose_decoder = torch.nn.Linear(4, 4)
+        self.object_pose_decoder = torch.nn.Linear(4, 4)
+        self.hand_global_head = torch.nn.Linear(4, 4)
+        self.hand_pose_head = torch.nn.Linear(4, 4)
         self.hand_mano_head = torch.nn.Linear(4, 4)
         self.object_pose_head = torch.nn.Linear(4, 4)
+        self.hand_token_fuse = torch.nn.Linear(4, 4)
+        self.ho_hand_scene_cross_alpha = torch.nn.Parameter(torch.zeros(36))
+        self.ho_object_scene_cross_alpha = torch.nn.Parameter(torch.zeros(36))
         self.register_token = torch.nn.Parameter(torch.zeros(1, 1, 4))
         self.metric_token = torch.nn.Parameter(torch.zeros(1, 1, 4))
-        self.ho_decoder = torch.nn.Module()
-        self.ho_decoder.lora_a = torch.nn.Parameter(torch.ones(4, 4))
-        self.ho_decoder.bias = torch.nn.Parameter(torch.zeros(4))
-        self.ho_decoder.norm = torch.nn.LayerNorm(4)
+        self.ho_decoder = torch.nn.ModuleList([_make_dummy_ho_block()])
         class _DecodingMano(torch.nn.Module):
             side = "right"
 
@@ -56,7 +99,7 @@ class _DummyPi3XModel(torch.nn.Module):
         assert torch.isfinite(imgs).all()
         batch, views = imgs.shape[:2]
         height, width = imgs.shape[-2:]
-        num_hands = 0 if kwargs.get("hand_owner_index") is None else kwargs["hand_owner_index"].shape[0]
+        hand_valid = (kwargs["hand_masks"].sum(dim=(-1, -2)) > 0)
         local_points = torch.ones((batch, views, height, width, 3), device=imgs.device)
         local_points[..., 2] = 2.0
         return {
@@ -64,18 +107,18 @@ class _DummyPi3XModel(torch.nn.Module):
             "points": torch.ones_like(local_points),
             "camera_poses": torch.eye(4, device=imgs.device)[None, None].repeat(batch, views, 1, 1),
             "metric": torch.ones((batch,), device=imgs.device),
-            "hand_owner_index": kwargs.get("hand_owner_index"),
-            "pred_hand_transl_dir": torch.tensor([[1.0, 0.0, 0.0]], device=imgs.device).repeat(num_hands, 1),
-            "pred_hand_transl_log_scale": torch.zeros((num_hands, 1), device=imgs.device),
-            "pred_hand_transl_scale": torch.ones((num_hands, 1), device=imgs.device),
-            "pred_hand_transl": torch.tensor([[1.0, 0.0, 0.0]], device=imgs.device).repeat(num_hands, 1),
-            "pred_hand_log_scale": torch.zeros((num_hands, 1), device=imgs.device),
-            "pred_hand_scale": torch.ones((num_hands, 1), device=imgs.device),
+            "pred_hand_transl_dir": torch.tensor([[[1.0, 0.0, 0.0]]], device=imgs.device).repeat(batch, views, 1),
+            "pred_hand_transl_log_scale": torch.zeros((batch, views, 1), device=imgs.device),
+            "pred_hand_transl_scale": torch.ones((batch, views, 1), device=imgs.device),
+            "pred_hand_transl": torch.tensor([[[1.0, 0.0, 0.0]]], device=imgs.device).repeat(batch, views, 1),
+            "pred_hand_log_scale": torch.zeros((batch, views, 1), device=imgs.device),
+            "pred_hand_scale": torch.ones((batch, views, 1), device=imgs.device),
             "pred_hand_mano_params": {
-                "global_orient": torch.zeros((num_hands, 1, 3, 3), device=imgs.device),
-                "hand_pose": torch.zeros((num_hands, 15, 3, 3), device=imgs.device),
-                "betas": torch.zeros((num_hands, 10), device=imgs.device),
+                "global_orient": torch.zeros((batch, views, 1, 3, 3), device=imgs.device),
+                "hand_pose": torch.zeros((batch, views, 15, 3, 3), device=imgs.device),
+                "betas": torch.zeros((batch, views, 10), device=imgs.device),
             },
+            "hand_valid_mask": hand_valid,
             "pred_object_rot6d": torch.zeros((batch, views, 6), device=imgs.device),
             "pred_object_transl_dir": torch.tensor([[[0.0, 1.0, 0.0]]], device=imgs.device).repeat(batch, views, 1),
             "pred_object_transl_log_scale": torch.zeros((batch, views, 1), device=imgs.device),
@@ -100,9 +143,9 @@ class _CapturingPi3XModel(_DummyPi3XModel):
 class _LocalJointPi3XModel(_DummyPi3XModel):
     def forward(self, **kwargs):
         out = super().forward(**kwargs)
-        num_hands = 0 if kwargs.get("hand_owner_index") is None else kwargs["hand_owner_index"].shape[0]
-        out["pred_hand_joints_local"] = torch.ones((num_hands, 21, 3), device=kwargs["imgs"].device)
-        out["pred_hand_vertices_local"] = torch.ones((num_hands, 778, 3), device=kwargs["imgs"].device)
+        batch, views = kwargs["imgs"].shape[:2]
+        out["pred_hand_joints_local"] = torch.ones((batch, views, 21, 3), device=kwargs["imgs"].device)
+        out["pred_hand_vertices_local"] = torch.ones((batch, views, 778, 3), device=kwargs["imgs"].device)
         return out
 
 
@@ -249,11 +292,14 @@ class Pi3XTrainerSmokeTests(unittest.TestCase):
                         "mask": torch.ones((1, 4, 4), dtype=torch.float32),
                         "valid": torch.tensor([True]),
                         "pose_mano": torch.zeros((1, 48), dtype=torch.float32),
+                        "pose_repr": ["mano_full_aa"],
                         "mano_betas": torch.zeros((1, 10), dtype=torch.float32),
                         "hand_transl": torch.zeros((1, 3), dtype=torch.float32),
                         "joints_3d_cam": torch.zeros((1, 21, 3), dtype=torch.float32),
                         "joints_2d": torch.zeros((1, 21, 2), dtype=torch.float32),
                         "mano_side": ["right"],
+                        "global_orient_rotmat_gt": torch.eye(3, dtype=torch.float32).view(1, 1, 3, 3),
+                        "pose_rotmat_gt": torch.eye(3, dtype=torch.float32).view(1, 1, 1, 3, 3).repeat(1, 1, 15, 1, 1),
                     },
                     "object": {
                         "mask": torch.zeros((1, 4, 4), dtype=torch.float32),
@@ -266,7 +312,6 @@ class Pi3XTrainerSmokeTests(unittest.TestCase):
                         "depthmap": torch.zeros((1, 4, 4), dtype=torch.float32),
                         "camera_intrinsics": torch.eye(3, dtype=torch.float32).unsqueeze(0),
                         "camera_pose": torch.eye(4, dtype=torch.float32).unsqueeze(0),
-                        "template_vertices": torch.zeros((8, 3), dtype=torch.float32),
                         "normalization_center": torch.zeros((3,), dtype=torch.float32),
                         "normalization_scale": torch.ones((1,), dtype=torch.float32),
                     },
@@ -278,21 +323,26 @@ class Pi3XTrainerSmokeTests(unittest.TestCase):
 
         self.assertIn("pred_hand_joints_local", pred)
         self.assertIn("pred_hand_vertices_local", pred)
-        self.assertEqual(tuple(pred["pred_hand_joints_local"].shape), (1, 21, 3))
-        self.assertEqual(tuple(pred["pred_hand_vertices_local"].shape), (1, 778, 3))
+        self.assertEqual(tuple(pred["pred_hand_joints_local"].shape), (1, 1, 21, 3))
+        self.assertEqual(tuple(pred["pred_hand_vertices_local"].shape), (1, 1, 778, 3))
 
     def test_build_optimizer_groups_trainable_modules_as_expected(self) -> None:
         cfg = _Cfg(type="AdamW", lr=1e-4, weight_decay=5e-2, betas=[0.9, 0.95], encoder_lr=1e-5)
         trainer = Pi3XTrainer.__new__(Pi3XTrainer)
         model = _DummyTrainableModule()
+        apply_pi3x_training_policy(model)
 
         optimizer = trainer.build_optimizer(cfg, model)
         self.assertEqual(len(optimizer.param_groups), 3)
         group_lrs = sorted({group["lr"] for group in optimizer.param_groups})
         self.assertEqual(group_lrs, [1e-4])
         trainable = {name for name, param in model.named_parameters() if param.requires_grad}
-        self.assertIn("ho_decoder.lora_a", trainable)
+        self.assertIn("ho_decoder.0.cross_attn.q_proj.weight", trainable)
+        self.assertIn("ho_decoder.0.norm2.weight", trainable)
+        self.assertIn("ho_hand_scene_cross_alpha", trainable)
         self.assertIn("hand_token_adapter.weight", trainable)
+        # Self-attn base weight is frozen (LoRA), only lora_A/lora_B are trainable
+        self.assertNotIn("ho_decoder.0.attn.qkv.weight", trainable)
 
     def test_forward_batch_accepts_precomputed_dataset_sample(self) -> None:
         trainer = Pi3XTrainer.__new__(Pi3XTrainer)
@@ -319,7 +369,6 @@ class Pi3XTrainerSmokeTests(unittest.TestCase):
                 "intrinsics": torch.eye(3).view(1, 1, 3, 3),
                 "poses": torch.eye(4).view(1, 1, 4, 4),
                 "hand_masks": torch.ones(1, 1, 4, 4),
-                "hand_owner_index": torch.tensor([[[0, 0, 0]]], dtype=torch.long),
                 "hand_is_right": torch.tensor([[True]], dtype=torch.bool),
                 "object_masks": torch.ones(1, 1, 4, 4, dtype=torch.bool),
                 "object_valid": torch.ones(1, 1, dtype=torch.bool),
@@ -332,22 +381,21 @@ class Pi3XTrainerSmokeTests(unittest.TestCase):
             },
             "gt_metric": {
                 "hand_valid": torch.tensor([[True]], dtype=torch.bool),
-                "hand_pose_coeffs": torch.zeros(1, 1, 48),
                 "hand_transl": torch.tensor([[[1.0, 0.0, 0.0]]]),
                 "hand_mano_betas": torch.zeros(1, 1, 10),
                 "hand_joints_3d": torch.full((1, 1, 21, 3), 0.5),
                 "hand_joints_2d": torch.zeros(1, 1, 21, 2),
                 "hand_camera_intrinsics": torch.eye(3).view(1, 1, 3, 3),
                 "hand_is_right": torch.tensor([[True]], dtype=torch.bool),
-                "hand_owner_index": torch.tensor([[[0, 0, 0]]], dtype=torch.long),
+                "hand_global_orient_rotmat_gt": torch.eye(3).view(1, 1, 1, 3, 3),
+                "hand_pose_rotmat_gt": torch.eye(3).view(1, 1, 1, 3, 3).repeat(1, 1, 15, 1, 1),
                 "object_valid": torch.tensor([[True]], dtype=torch.bool),
                 "object_pose_obj2cam": torch.tensor(
                     [[[[1.0, 0.0, 0.0, 1.5], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.5], [0.0, 0.0, 0.0, 1.0]]]]
                 ),
                 "object_camera_intrinsics": torch.eye(3).view(1, 1, 3, 3),
-                "object_template_vertices": torch.zeros(1, 2, 3),
                 "object_normalization_center": torch.tensor([[0.1, 0.2, 0.3]]),
-                "object_normalization_scale": torch.tensor([1.25]),
+                "object_scale_canonical_to_target": torch.tensor([1.25]),
             },
             "gt_scale_meta": {
                 "scene_focus_masks": torch.ones(1, 1, 4, 4, dtype=torch.bool),
@@ -367,18 +415,18 @@ class Pi3XTrainerSmokeTests(unittest.TestCase):
         self.assertIn("object_valid", trainer.model.last_kwargs)
         self.assertEqual(trainer.model.last_kwargs["object_masks"].shape, (1, 1, 4, 4))
         self.assertEqual(trainer.model.last_kwargs["object_valid"].shape, (1, 1))
-        self.assertEqual(tuple(pred["pred_hand_transl"].shape), (1, 3))
+        self.assertEqual(tuple(pred["pred_hand_transl"].shape), (1, 1, 3))
         self.assertEqual(tuple(gt["object_pose_obj2cam"].shape), (1, 1, 4, 4))
-        self.assertEqual(tuple(gt["hand_owner_index"].shape), (1, 3))
-        self.assertTrue(torch.allclose(gt["hand_transl"], torch.tensor([[2.0, 0.0, 0.0]])))
-        self.assertTrue(torch.allclose(gt["hand_scale"], torch.tensor([[2.0]])))
-        self.assertTrue(torch.allclose(gt["hand_joints_3d"], torch.full((1, 21, 3), 1.0)))
+        self.assertNotIn("hand_owner_index", gt)
+        self.assertTrue(torch.allclose(gt["hand_transl"], torch.tensor([[[2.0, 0.0, 0.0]]])))
+        self.assertTrue(torch.allclose(gt["hand_scale"], torch.tensor([[[2.0]]])))
+        self.assertTrue(torch.allclose(gt["hand_joints_3d"], torch.full((1, 1, 21, 3), 1.0)))
         self.assertTrue(torch.allclose(gt["object_pose_obj2cam"][0, 0, :3, 3], torch.tensor([3.0, 0.0, 1.0])))
         self.assertTrue(torch.allclose(gt["object_normalization_center"], torch.tensor([[0.1, 0.2, 0.3]])))
         self.assertTrue(torch.allclose(gt["object_normalization_scale"], torch.tensor([[[2.5]]])))
         self.assertNotIn("hand_vertices", gt)
-        self.assertIn("hand_global_orient_rotmat", gt)
-        self.assertIn("hand_pose_rotmat", gt)
+        self.assertTrue(torch.allclose(gt["hand_global_orient_rotmat"], torch.eye(3).view(1, 1, 1, 3, 3)))
+        self.assertEqual(tuple(gt["hand_pose_rotmat"].shape), (1, 1, 15, 3, 3))
         self.assertNotIn("hand_pose_mano", gt)
         self.assertNotIn("hand_pose_coeffs", gt)
         self.assertNotIn("object_vertices_2d", gt)
@@ -405,11 +453,14 @@ class Pi3XTrainerSmokeTests(unittest.TestCase):
                         "mask": torch.ones(1, 4, 4, dtype=torch.bool),
                         "valid": torch.tensor([True]),
                         "pose_mano": torch.zeros(1, 48),
+                        "pose_repr": ["mano_full_aa"],
                         "hand_transl": torch.tensor([[1.0, 0.0, 0.0]]),
                         "mano_betas": torch.zeros(1, 10),
                         "joints_3d_cam": torch.full((1, 21, 3), 0.5),
                         "joints_2d": torch.zeros(1, 21, 2),
                         "mano_side": ["right"],
+                        "global_orient_rotmat_gt": torch.eye(3).view(1, 1, 3, 3),
+                        "pose_rotmat_gt": torch.eye(3).view(1, 1, 1, 3, 3).repeat(1, 1, 15, 1, 1),
                     },
                     "object": {
                         "grasped_object_id": torch.tensor([11], dtype=torch.int32),
@@ -425,7 +476,6 @@ class Pi3XTrainerSmokeTests(unittest.TestCase):
                         ),
                     },
                     "object_multiview": {
-                        "template_vertices": torch.zeros(1, 2, 3),
                         "normalization_center": torch.tensor([[0.1, 0.2, 0.3]]),
                         "normalization_scale": torch.tensor([1.25]),
                     },
@@ -442,9 +492,9 @@ class Pi3XTrainerSmokeTests(unittest.TestCase):
                 with mock.patch("trainers.pi3x_trainer.vis_export.convert_scene_gt_to_pred_scale", side_effect=lambda gt_metric, scene_scale: {**dict(gt_metric), "scene_scale": scene_scale}):
                     pred, gt = trainer.forward_batch(batch, mode="train")
 
-        self.assertEqual(tuple(pred["pred_hand_transl"].shape), (1, 3))
+        self.assertEqual(tuple(pred["pred_hand_transl"].shape), (1, 1, 3))
         self.assertEqual(tuple(gt["object_pose_obj2cam"].shape), (1, 1, 4, 4))
-        self.assertTrue(torch.allclose(gt["hand_transl"], torch.tensor([[2.0, 0.0, 0.0]])))
+        self.assertTrue(torch.allclose(gt["hand_transl"], torch.tensor([[[2.0, 0.0, 0.0]]])))
         self.assertTrue(torch.allclose(gt["object_normalization_scale"], torch.tensor([[[2.5]]])))
 
     def test_forward_batch_sanitizes_non_finite_scene_images_in_precomputed_sample(self) -> None:
@@ -474,7 +524,6 @@ class Pi3XTrainerSmokeTests(unittest.TestCase):
                 "intrinsics": torch.eye(3).view(1, 1, 3, 3),
                 "poses": torch.eye(4).view(1, 1, 4, 4),
                 "hand_masks": torch.zeros(1, 1, 4, 4),
-                "hand_owner_index": torch.tensor([[[0, 0, 0]]], dtype=torch.long),
                 "hand_is_right": torch.tensor([[True]], dtype=torch.bool),
                 "object_masks": torch.ones(1, 1, 4, 4, dtype=torch.bool),
                 "object_valid": torch.ones(1, 1, dtype=torch.bool),
@@ -487,20 +536,19 @@ class Pi3XTrainerSmokeTests(unittest.TestCase):
             },
             "gt_metric": {
                 "hand_valid": torch.tensor([[False]], dtype=torch.bool),
-                "hand_pose_coeffs": torch.zeros(1, 1, 48),
                 "hand_transl": torch.zeros(1, 1, 3),
                 "hand_mano_betas": torch.zeros(1, 1, 10),
                 "hand_joints_3d": torch.zeros(1, 1, 21, 3),
                 "hand_joints_2d": torch.zeros(1, 1, 21, 2),
                 "hand_camera_intrinsics": torch.eye(3).view(1, 1, 3, 3),
                 "hand_is_right": torch.tensor([[True]], dtype=torch.bool),
-                "hand_owner_index": torch.tensor([[[0, 0, 0]]], dtype=torch.long),
+                "hand_global_orient_rotmat_gt": torch.eye(3).view(1, 1, 1, 3, 3),
+                "hand_pose_rotmat_gt": torch.eye(3).view(1, 1, 1, 3, 3).repeat(1, 1, 15, 1, 1),
                 "object_valid": torch.tensor([[True]], dtype=torch.bool),
                 "object_pose_obj2cam": torch.eye(4).view(1, 1, 4, 4),
                 "object_camera_intrinsics": torch.eye(3).view(1, 1, 3, 3),
-                "object_template_vertices": torch.zeros(1, 2, 3),
                 "object_normalization_center": torch.zeros(1, 3),
-                "object_normalization_scale": torch.ones(1),
+                "object_scale_canonical_to_target": torch.ones(1),
             },
             "gt_scale_meta": {
                 "scene_focus_masks": torch.ones(1, 1, 4, 4, dtype=torch.bool),

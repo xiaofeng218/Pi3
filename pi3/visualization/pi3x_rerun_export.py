@@ -425,17 +425,6 @@ def _select_pred_hand_joints(pred, sample_index, frame_idx):
 
 
 def _select_pred_hand_mesh_inputs(pred, sample_index, frame_idx):
-    hand_owner_index = pred.get("hand_owner_index", None)
-    if hand_owner_index is None:
-        return None
-    if not torch.is_tensor(hand_owner_index):
-        hand_owner_index = torch.as_tensor(hand_owner_index)
-    if hand_owner_index.numel() == 0:
-        return None
-    matches = (hand_owner_index[:, 0] == sample_index) & (hand_owner_index[:, 1] == frame_idx)
-    if not matches.any():
-        return None
-    idx = matches.nonzero(as_tuple=False)[0, 0]
     mano_params = pred.get("pred_hand_mano_params", None)
     hand_betas = pred.get("pred_hand_mano_betas", None)
     hand_transl = pred.get("pred_hand_transl", None)
@@ -443,17 +432,117 @@ def _select_pred_hand_mesh_inputs(pred, sample_index, frame_idx):
     hand_is_right = pred.get("hand_is_right", None)
     if mano_params is None or hand_betas is None or hand_transl is None or hand_scale is None:
         return None
-    hand_side = "right"
-    if hand_is_right is not None:
-        hand_side = "right" if bool(hand_is_right[idx]) else "left"
-    return {
-        "global_orient": mano_params["global_orient"][idx],
-        "hand_pose": mano_params["hand_pose"][idx],
-        "betas": hand_betas[idx],
-        "transl": hand_transl[idx],
-        "scale": hand_scale[idx],
-        "hand_side": hand_side,
-    }
+
+    hand_owner_index = pred.get("hand_owner_index", None)
+    if hand_owner_index is not None:
+        if not torch.is_tensor(hand_owner_index):
+            hand_owner_index = torch.as_tensor(hand_owner_index)
+        if hand_owner_index.numel() == 0:
+            return None
+        matches = (hand_owner_index[:, 0] == sample_index) & (hand_owner_index[:, 1] == frame_idx)
+        if matches.any():
+            idx = matches.nonzero(as_tuple=False)[0, 0]
+            hand_side = "right"
+            if hand_is_right is not None:
+                hand_side = "right" if bool(hand_is_right[idx]) else "left"
+            return {
+                "global_orient": mano_params["global_orient"][idx],
+                "hand_pose": mano_params["hand_pose"][idx],
+                "betas": hand_betas[idx],
+                "transl": hand_transl[idx],
+                "scale": hand_scale[idx],
+                "hand_side": hand_side,
+            }
+
+    if (
+        torch.is_tensor(hand_transl)
+        and hand_transl.ndim >= 3
+        and hand_transl.shape[0] > sample_index
+        and hand_transl.shape[1] > frame_idx
+    ):
+        idx = (sample_index, frame_idx)
+        hand_side = "right"
+        if hand_is_right is not None:
+            hand_side = "right" if bool(hand_is_right[sample_index, frame_idx]) else "left"
+        return {
+            "global_orient": mano_params["global_orient"][idx],
+            "hand_pose": mano_params["hand_pose"][idx],
+            "betas": hand_betas[idx],
+            "transl": hand_transl[idx],
+            "scale": hand_scale[idx],
+            "hand_side": hand_side,
+        }
+
+    return None
+
+
+def _select_gt_hand_mesh_inputs(gt, sample_index, frame_idx):
+    hand_valid = gt.get("hand_valid", None)
+    if hand_valid is None:
+        return None
+
+    owner = gt.get("hand_owner_index", None)
+    hand_global_orient_rotmat = gt.get("hand_global_orient_rotmat", None)
+    hand_pose_rotmat = gt.get("hand_pose_rotmat", None)
+    mano_betas = gt.get("hand_mano_betas", None)
+    hand_transl = gt.get("hand_transl", None)
+    hand_scale = gt.get("hand_scale", None)
+    hand_is_right = gt.get("hand_is_right", None)
+    if hand_global_orient_rotmat is None or hand_pose_rotmat is None or mano_betas is None:
+        return None
+
+    if owner is not None and torch.is_tensor(owner) and owner.numel() > 0:
+        matches = (owner[:, 0] == sample_index) & (owner[:, 1] == frame_idx)
+        if matches.any():
+            idx = matches.nonzero(as_tuple=False)[0, 0]
+            hand_side = "right"
+            if hand_is_right is not None:
+                hand_side = "right" if bool(hand_is_right[idx]) else "left"
+            return {
+                "global_orient": hand_global_orient_rotmat[idx],
+                "hand_pose": hand_pose_rotmat[idx],
+                "betas": mano_betas[idx],
+                "transl": hand_transl[idx] if hand_transl is not None else None,
+                "scale": hand_scale[idx] if hand_scale is not None else None,
+                "hand_side": hand_side,
+            }
+        return None
+
+    if (
+        torch.is_tensor(hand_valid)
+        and hand_valid.ndim >= 2
+        and hand_valid.shape[0] > sample_index
+        and hand_valid.shape[1] > frame_idx
+    ):
+        if not bool(hand_valid[sample_index, frame_idx]):
+            return None
+        hand_side = "right"
+        if hand_is_right is not None:
+            hand_side = "right" if bool(hand_is_right[sample_index, frame_idx]) else "left"
+        def _select_dense_hand_value(value):
+            if value is None or not torch.is_tensor(value):
+                return value
+            if value.ndim >= 2:
+                sample_value = value[sample_index]
+                if sample_value.ndim >= 1:
+                    if sample_value.shape[0] == 0:
+                        return None
+                    view_index = min(frame_idx, sample_value.shape[0] - 1)
+                    return sample_value[view_index]
+                return sample_value
+            if value.ndim >= 1:
+                return value[sample_index]
+            return value
+        return {
+            "global_orient": hand_global_orient_rotmat[sample_index, frame_idx],
+            "hand_pose": hand_pose_rotmat[sample_index, frame_idx],
+            "betas": mano_betas[sample_index, frame_idx],
+            "transl": _select_dense_hand_value(hand_transl),
+            "scale": _select_dense_hand_value(hand_scale),
+            "hand_side": hand_side,
+        }
+
+    return None
 
 
 def _log_hand_joint_correspondence_or_clear(rr, entity_path, gt_joints, pred_joints, color):
@@ -854,33 +943,20 @@ def export_pi3x_rerun_sample(output_path, batch, pred, gt, sample_index, data_ro
 
         gt_hand_vertices_np = None
         gt_hand_joints_np = None
-        if "hand_valid" in gt:
-            owner = gt.get("hand_owner_index", None)
-            if owner is not None and owner.numel() > 0:
-                matches = (owner[:, 0] == sample_index) & (owner[:, 1] == frame_idx)
-                if matches.any():
-                    idx = matches.nonzero(as_tuple=False)[0, 0]
-                    hand_side = "right"
-                    if "hand_is_right" in gt:
-                        hand_side = "right" if bool(gt["hand_is_right"][idx]) else "left"
-                    mano_betas = gt.get("hand_mano_betas", None)
-                    hand_global_orient_rotmat = gt.get("hand_global_orient_rotmat", None)
-                    hand_pose_rotmat = gt.get("hand_pose_rotmat", None)
-                    hand_transl = gt.get("hand_transl", None)
-                    hand_scale = gt.get("hand_scale", None)
-                    if hand_global_orient_rotmat is not None and hand_pose_rotmat is not None and mano_betas is not None:
-                        verts_m, joints_m, _ = _build_hand_mesh_vertices_from_rotmat(
-                            hand_global_orient_rotmat[idx],
-                            hand_pose_rotmat[idx],
-                            mano_betas[idx],
-                            mano_layer,
-                            hand_side=hand_side,
-                            hand_transl=hand_transl[idx] if hand_transl is not None else None,
-                            hand_scale=hand_scale[idx] if hand_scale is not None else None,
-                        )
-                        if verts_m is not None and joints_m is not None:
-                            gt_hand_vertices_np = np.asarray(verts_m, dtype=np.float32)
-                            gt_hand_joints_np = np.asarray(joints_m, dtype=np.float32)
+        gt_hand_mesh_inputs = _select_gt_hand_mesh_inputs(gt, sample_index, frame_idx)
+        if gt_hand_mesh_inputs is not None:
+            verts_m, joints_m, _ = _build_hand_mesh_vertices_from_rotmat(
+                gt_hand_mesh_inputs["global_orient"],
+                gt_hand_mesh_inputs["hand_pose"],
+                gt_hand_mesh_inputs["betas"],
+                mano_layer,
+                hand_side=gt_hand_mesh_inputs["hand_side"],
+                hand_transl=gt_hand_mesh_inputs["transl"],
+                hand_scale=gt_hand_mesh_inputs["scale"],
+            )
+            if verts_m is not None and joints_m is not None:
+                gt_hand_vertices_np = np.asarray(verts_m, dtype=np.float32)
+                gt_hand_joints_np = np.asarray(joints_m, dtype=np.float32)
 
         pred_hand_vertices = None
         pred_hand_joints_np = None

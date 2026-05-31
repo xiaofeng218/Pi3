@@ -16,7 +16,6 @@ import torch
 from torch import nn, Tensor
 
 from .attention import Attention, MemEffAttention, CrossAttentionRope, MemEffCrossAttentionRope, FlashAttentionRope, FlashCrossAttentionRope, PRopeFlashAttention
-from .lora import LoRALinear
 from ..dinov2.layers.drop_path import DropPath
 from ..dinov2.layers.layer_scale import LayerScale
 from ..dinov2.layers.mlp import Mlp
@@ -424,7 +423,6 @@ class HOBlockRope(nn.Module):
         init_values=None,
         qk_norm: bool = False,
         rope=None,
-        lora_cfg: Dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
@@ -459,41 +457,6 @@ class HOBlockRope(nn.Module):
             act_layer=act_layer,
             bias=ffn_bias,
         )
-        if lora_cfg is not None:
-            self.enable_lora(**lora_cfg)
-
-    def enable_lora(
-        self,
-        rank: int = 4,
-        alpha: float = 8.0,
-        targets: List[str] | Tuple[str, ...] | None = None,
-    ) -> None:
-        targets = set(targets or ("cross_attn",))
-        if "cross_attn" in targets:
-            self.cross_attn.q_proj = LoRALinear.from_linear(self.cross_attn.q_proj, rank=rank, alpha=alpha)
-            self.cross_attn.k_proj = LoRALinear.from_linear(self.cross_attn.k_proj, rank=rank, alpha=alpha)
-            self.cross_attn.v_proj = LoRALinear.from_linear(self.cross_attn.v_proj, rank=rank, alpha=alpha)
-            self.cross_attn.proj = LoRALinear.from_linear(self.cross_attn.proj, rank=rank, alpha=alpha)
-        if "self_attn" in targets and hasattr(self.attn, "qkv"):
-            self.attn.qkv = LoRALinear.from_linear(self.attn.qkv, rank=rank, alpha=alpha)
-            self.attn.proj = LoRALinear.from_linear(self.attn.proj, rank=rank, alpha=alpha)
-        if "mlp" in targets and hasattr(self.mlp, "fc1"):
-            self.mlp.fc1 = LoRALinear.from_linear(self.mlp.fc1, rank=rank, alpha=alpha)
-            self.mlp.fc2 = LoRALinear.from_linear(self.mlp.fc2, rank=rank, alpha=alpha)
-
-        for name, param in self.attn.named_parameters():
-            if "q_norm" in name or "k_norm" in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-
-        if "self_attn" not in targets:
-            for param in self.mlp.parameters():
-                param.requires_grad = False
-        else:
-            for name, param in self.attn.named_parameters():
-                if "qkv" in name or "proj" in name:
-                    param.requires_grad = "lora_" in name
 
     def forward(
         self,
@@ -503,6 +466,7 @@ class HOBlockRope(nn.Module):
         ypos=None,
         enable_self_attn: bool = True,
         enable_cross_attn: bool = True,
+        cross_alpha: Tensor | float | None = None,
     ) -> Tensor:
         def attn_residual_func(x: Tensor) -> Tensor:
             return self.ls1(self.attn(self.norm1(x), xpos=xpos))
@@ -516,10 +480,22 @@ class HOBlockRope(nn.Module):
         if enable_self_attn:
             x = x + attn_residual_func(x)
         if enable_cross_attn and y is not None:
-            y_ = self.norm_y(y)
-            x = x + cross_attn_residual_func(x, y_)
+            cross_residual = self.cross_attn_residual(x, y, xpos=xpos, ypos=ypos)
+            if cross_alpha is not None:
+                cross_residual = cross_residual * torch.as_tensor(cross_alpha, device=x.device, dtype=x.dtype)
+            x = x + cross_residual
         x = x + ffn_residual_func(x)
         return x
+
+    def cross_attn_residual(
+        self,
+        x: Tensor,
+        y: Tensor,
+        xpos=None,
+        ypos=None,
+    ) -> Tensor:
+        y_ = self.norm_y(y)
+        return self.ls_y(self.cross_attn(self.norm2(x), y_, y_, qpos=xpos, kpos=ypos))
 
 
 def _copy_module_state(dst: nn.Module, src: nn.Module) -> None:
@@ -538,17 +514,20 @@ def _copy_module_state(dst: nn.Module, src: nn.Module) -> None:
         transferable[key] = value
 
     missing_in_src = [key for key in dst_state.keys() if key not in src_state]
-    non_lora_missing = [key for key in missing_in_src if "lora_" not in key]
-    if non_lora_missing:
+    if missing_in_src:
         raise RuntimeError(
             f"Cannot warm-start {type(dst).__name__} from {type(src).__name__}; "
-            f"non-LoRA keys are missing from source: {non_lora_missing}"
+            f"keys are missing from source: {missing_in_src}"
         )
 
     dst.load_state_dict(transferable, strict=False)
 
 
-def init_ho_block_from_decoder_block(ho_blk: HOBlockRope, blk: nn.Module, cross_scale: float = 1e-3) -> None:
+def init_ho_block_from_decoder_block(
+    ho_blk: HOBlockRope,
+    blk: nn.Module,
+    cross_scale: float | None = None,
+) -> None:
     """Warm-start an HOBlockRope from a decoder BlockRope.
 
     The self-attention/MLP path is copied directly. The cross-attention path
@@ -580,7 +559,10 @@ def init_ho_block_from_decoder_block(ho_blk: HOBlockRope, blk: nn.Module, cross_
         _copy_module_state(ho_blk.cross_attn.q_norm, blk.attn.q_norm)
         _copy_module_state(ho_blk.cross_attn.k_norm, blk.attn.k_norm)
         if hasattr(ho_blk.ls_y, "gamma"):
-            ho_blk.ls_y.gamma.fill_(cross_scale)
+            if cross_scale is None:
+                _copy_module_state(ho_blk.ls_y, blk.ls1)
+            else:
+                ho_blk.ls_y.gamma.fill_(cross_scale)
 
 
 from ...utils.geometry import se3_inverse

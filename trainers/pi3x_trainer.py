@@ -58,20 +58,30 @@ class Pi3XTrainer(BaseTrainer):
         def param_group_fn(model_):
             heads = []
             adapters = []
-            lora = []
+            ho_cross = []
             for name, param in model_.named_parameters():
                 if not param.requires_grad:
                     continue
-                if "ho_decoder" in name and "lora_" in name:
-                    lora.append(param)
+                if name.startswith(
+                    (
+                        "ho_decoder",
+                        "ho_hand_scene_cross_alpha",
+                        "ho_object_scene_cross_alpha",
+                    )
+                ):
+                    ho_cross.append(param)
                 elif name.startswith(
                     (
                         "hand_token_adapter",
                         "object_query_adapter",
+                        "hand_global_decoder",
+                        "hand_pose_decoder",
+                        "object_pose_decoder",
+                        "hand_global_head",
+                        "hand_pose_head",
                         "hand_mano_head",
                         "object_pose_head",
-                        "register_token",
-                        "metric_token",
+                        "hand_token_fuse",
                     )
                 ):
                     adapters.append(param)
@@ -82,7 +92,7 @@ class Pi3XTrainer(BaseTrainer):
             return [
                 {"params": heads, "lr": lr, "weight_decay": weight_decay},
                 {"params": adapters, "lr": lr, "weight_decay": 0.0},
-                {"params": lora, "lr": lr, "weight_decay": 0.0},
+                {"params": ho_cross, "lr": lr, "weight_decay": 0.0},
             ]
 
         return super().build_optimizer(cfg_optimizer, model, param_group_fn=param_group_fn)
@@ -190,65 +200,34 @@ class Pi3XTrainer(BaseTrainer):
     def _has_views_sample(self, batch) -> bool:
         return isinstance(batch, dict) and "views" in batch
 
-    def _rebase_and_flatten_owner_index(self, owner_index: torch.Tensor) -> torch.Tensor:
-        if owner_index.ndim != 3 or owner_index.shape[-1] != 3:
-            raise ValueError(f"Expected owner_index with shape (B,N,3), got {tuple(owner_index.shape)}")
-        batch_size, num_views = owner_index.shape[:2]
-        rebased = owner_index.clone()
-        rebased[..., 0] = torch.arange(batch_size, device=owner_index.device, dtype=owner_index.dtype).view(batch_size, 1)
-        return rebased.reshape(batch_size * num_views, 3)
-
-    def _sparsify_hand_gt_from_dense(self, gt_metric, owner_index):
-        device = gt_metric["hand_valid"].device
-        if owner_index is None or owner_index.numel() == 0:
-            return {
-                "hand_valid": torch.zeros((1,), dtype=torch.bool, device=device),
-                "hand_pose_coeffs": gt_metric["hand_pose_coeffs"][:1, :1].reshape(1, -1) * 0.0,
-                "hand_transl": torch.zeros((1, 3), dtype=torch.float32, device=device),
-                "hand_mano_betas": gt_metric["hand_mano_betas"][:1, :1].reshape(1, -1) * 0.0,
-                "hand_joints_3d": torch.zeros((1, 21, 3), dtype=torch.float32, device=device),
-                "hand_joints_2d": torch.zeros((1, 21, 2), dtype=torch.float32, device=device),
-                "hand_camera_intrinsics": gt_metric["hand_camera_intrinsics"][:1, :1].reshape(1, 3, 3) * 0.0,
-                "hand_is_right": torch.zeros((1,), dtype=torch.bool, device=device),
-                "hand_owner_index": torch.zeros((1, 3), dtype=torch.long, device=device),
-            }
-
-        batch_idx = owner_index[:, 0].long()
-        view_idx = owner_index[:, 1].long()
-        return {
-            "hand_valid": gt_metric["hand_valid"][batch_idx, view_idx],
-            "hand_pose_coeffs": gt_metric["hand_pose_coeffs"][batch_idx, view_idx],
-            "hand_transl": gt_metric["hand_transl"][batch_idx, view_idx],
-            "hand_mano_betas": gt_metric["hand_mano_betas"][batch_idx, view_idx],
-            "hand_joints_3d": gt_metric["hand_joints_3d"][batch_idx, view_idx],
-            "hand_joints_2d": gt_metric["hand_joints_2d"][batch_idx, view_idx],
-            "hand_camera_intrinsics": gt_metric["hand_camera_intrinsics"][batch_idx, view_idx],
-            "hand_is_right": gt_metric["hand_is_right"][batch_idx, view_idx],
-            "hand_owner_index": owner_index,
-        }
-
     def _decode_hand_pose_coeffs_to_rotmat(self, hand_pose_coeffs, hand_is_right):
         mano_layer = getattr(self._base_model, "hand_mano_layer", None)
         if mano_layer is None:
             raise RuntimeError("hand_mano_layer is required to decode DexYCB hand pose coefficients")
-        batch_size = hand_pose_coeffs.shape[0]
+        prefix_shape = hand_pose_coeffs.shape[:-1]
+        flat_pose_coeffs = hand_pose_coeffs.reshape(-1, hand_pose_coeffs.shape[-1])
+        flat_is_right = hand_is_right.reshape(-1)
+        batch_size = flat_pose_coeffs.shape[0]
         global_orient = torch.zeros((batch_size, 1, 3, 3), dtype=hand_pose_coeffs.dtype, device=hand_pose_coeffs.device)
         hand_pose = torch.zeros((batch_size, 15, 3, 3), dtype=hand_pose_coeffs.dtype, device=hand_pose_coeffs.device)
 
         def _decode_with_layer(layer, mask):
             idx = mask.nonzero(as_tuple=False).squeeze(-1)
-            decoded_global, decoded_pose = layer.decode_pose_coeffs_to_rotmat(hand_pose_coeffs[idx])
+            decoded_global, decoded_pose = layer.decode_pose_coeffs_to_rotmat(flat_pose_coeffs[idx])
             global_orient[idx] = decoded_global.to(dtype=hand_pose_coeffs.dtype, device=hand_pose_coeffs.device)
             hand_pose[idx] = decoded_pose.to(dtype=hand_pose_coeffs.dtype, device=hand_pose_coeffs.device)
 
         if isinstance(mano_layer, torch.nn.ModuleDict):
             for side_value, side_name in ((True, "right"), (False, "left")):
-                side_mask = hand_is_right == side_value
+                side_mask = flat_is_right == side_value
                 if side_mask.any():
                     _decode_with_layer(mano_layer[side_name], side_mask)
         else:
             _decode_with_layer(mano_layer, torch.ones((batch_size,), dtype=torch.bool, device=hand_pose_coeffs.device))
-        return global_orient, hand_pose
+        return (
+            global_orient.reshape(*prefix_shape, 1, 3, 3),
+            hand_pose.reshape(*prefix_shape, 15, 3, 3),
+        )
 
     def forward_batch(self, batch, mode="train"):
         del mode
@@ -273,43 +252,30 @@ class Pi3XTrainer(BaseTrainer):
         object_multiview = scene_inputs["object_multiview"]
         if object_multiview is not None:
             object_multiview = dict(object_multiview)
-            if "img" in object_multiview:
-                object_multiview["img"] = self._sanitize_tensor(
-                    "scene_inputs.object_multiview.img",
-                    object_multiview["img"],
-                    nan=0.0,
-                    posinf=1.0,
-                    neginf=0.0,
-                )
-            if "depthmap" in object_multiview:
-                object_multiview["depthmap"] = self._sanitize_tensor(
-                    "scene_inputs.object_multiview.depthmap",
-                    object_multiview["depthmap"],
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
-            if "camera_intrinsics" in object_multiview:
-                object_multiview["camera_intrinsics"] = self._sanitize_tensor(
-                    "scene_inputs.object_multiview.camera_intrinsics",
-                    object_multiview["camera_intrinsics"],
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
-            if "camera_pose" in object_multiview:
-                object_multiview["camera_pose"] = self._sanitize_tensor(
-                    "scene_inputs.object_multiview.camera_pose",
-                    object_multiview["camera_pose"],
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
+            object_multiview["img"] = self._sanitize_tensor(
+                "scene_inputs.object_multiview.img",
+                object_multiview["img"],
+                nan=0.0, posinf=1.0, neginf=0.0,
+            )
+            object_multiview["depthmap"] = self._sanitize_tensor(
+                "scene_inputs.object_multiview.depthmap",
+                object_multiview["depthmap"],
+                nan=0.0, posinf=0.0, neginf=0.0,
+            )
+            object_multiview["camera_intrinsics"] = self._sanitize_tensor(
+                "scene_inputs.object_multiview.camera_intrinsics",
+                object_multiview["camera_intrinsics"],
+                nan=0.0, posinf=0.0, neginf=0.0,
+            )
+            object_multiview["camera_pose"] = self._sanitize_tensor(
+                "scene_inputs.object_multiview.camera_pose",
+                object_multiview["camera_pose"],
+                nan=0.0, posinf=0.0, neginf=0.0,
+            )
         scene_focus_masks = gt_scale_meta["scene_focus_masks"]
 
-        hand_masks = scene_inputs["hand_masks"].reshape(-1, *scene_inputs["hand_masks"].shape[-2:])
-        hand_owner_index = self._rebase_and_flatten_owner_index(scene_inputs["hand_owner_index"])
-        hand_is_right = scene_inputs["hand_is_right"].reshape(-1)
+        hand_masks = scene_inputs["hand_masks"]
+        hand_is_right = scene_inputs["hand_is_right"]
 
         model_kwargs = {
             "imgs": imgs,
@@ -318,7 +284,6 @@ class Pi3XTrainer(BaseTrainer):
             "poses": poses if self._base_model.use_multimodal else None,
             "with_prior": True,
             "hand_masks": hand_masks,
-            "hand_owner_index": hand_owner_index,
             "hand_is_right": hand_is_right,
             "object_masks": object_masks,
             "object_valid": object_valid,
@@ -333,9 +298,6 @@ class Pi3XTrainer(BaseTrainer):
 
         pred = self.model(**model_kwargs)
 
-        owner_for_gt = pred.get("hand_owner_index", None)
-        hand_gt_metric = self._sparsify_hand_gt_from_dense(gt_metric_dense, owner_for_gt)
-
         with torch.no_grad():
             scene_scale = estimate_scene_scale_from_depth(
                 pred["local_points"][..., 2].detach(),
@@ -349,33 +311,54 @@ class Pi3XTrainer(BaseTrainer):
             gt = vis_export.convert_scene_gt_to_pred_scale(scene_gt_metric, scene_scale)
             del scene_gt_metric
 
-            owner_rows = hand_gt_metric["hand_owner_index"]
-            scale_per_hand = scene_scale[owner_rows[:, 0]].view(-1, 1)
-            gt_global_orient_rotmat, gt_hand_pose_rotmat = self._decode_hand_pose_coeffs_to_rotmat(
-                hand_gt_metric["hand_pose_coeffs"],
-                hand_gt_metric["hand_is_right"],
-            )
-            gt["hand_valid"] = hand_gt_metric["hand_valid"]
+            scale_per_hand = scene_scale.view(-1, 1, 1)
+            gt_global_orient_rotmat = gt_metric_dense.get("hand_global_orient_rotmat_gt", None)
+            gt_hand_pose_rotmat = gt_metric_dense.get("hand_pose_rotmat_gt", None)
+            if gt_global_orient_rotmat is None or gt_hand_pose_rotmat is None:
+                gt_global_orient_rotmat, gt_hand_pose_rotmat = self._decode_hand_pose_coeffs_to_rotmat(
+                    gt_metric_dense["hand_pose_coeffs"],
+                    gt_metric_dense["hand_is_right"],
+                )
+            gt["hand_valid"] = gt_metric_dense["hand_valid"]
             gt["hand_global_orient_rotmat"] = gt_global_orient_rotmat
             gt["hand_pose_rotmat"] = gt_hand_pose_rotmat
-            gt["hand_mano_betas"] = hand_gt_metric["hand_mano_betas"]
-            gt["hand_transl"] = hand_gt_metric["hand_transl"] * scale_per_hand
+            gt["hand_mano_betas"] = gt_metric_dense["hand_mano_betas"]
+            gt["hand_transl"] = gt_metric_dense["hand_transl"] * scale_per_hand
             gt["hand_scale"] = scale_per_hand
-            gt["hand_joints_3d"] = hand_gt_metric["hand_joints_3d"] * scale_per_hand.unsqueeze(1)
-            gt["hand_joints_2d"] = hand_gt_metric["hand_joints_2d"]
-            gt["hand_camera_intrinsics"] = hand_gt_metric["hand_camera_intrinsics"]
-            gt["hand_is_right"] = hand_gt_metric["hand_is_right"]
-            gt["hand_owner_index"] = owner_rows
+            gt["hand_joints_3d"] = gt_metric_dense["hand_joints_3d"] * scale_per_hand.unsqueeze(-1)
+            gt["hand_joints_2d"] = gt_metric_dense["hand_joints_2d"]
+            gt["hand_camera_intrinsics"] = gt_metric_dense["hand_camera_intrinsics"]
+            gt["hand_is_right"] = gt_metric_dense["hand_is_right"]
 
             obj_pose = gt_metric_dense["object_pose_obj2cam"].clone()
             obj_pose[..., :3, 3] = obj_pose[..., :3, 3] * scene_scale.view(-1, 1, 1)
             gt["object_valid"] = gt_metric_dense["object_valid"]
             gt["object_pose_obj2cam"] = obj_pose
             gt["object_normalization_center"] = gt_metric_dense["object_normalization_center"]
-            object_scale_metric = gt_metric_dense["object_normalization_scale"]
+            object_scale_metric = gt_metric_dense.get(
+                "object_scale_canonical_to_target",
+                gt_metric_dense.get(
+                "object_scale_canonical_to_scene_metric",
+                gt_metric_dense.get("object_normalization_scale"),
+                ),
+            )
             if object_scale_metric.ndim == 1:
                 object_scale_metric = object_scale_metric.view(-1, 1, 1)
             gt["object_normalization_scale"] = object_scale_metric * scene_scale.view(-1, 1, 1)
+
+            # OMV GT data for point and camera supervision
+            omv_data = scene_inputs.get("object_multiview", None)
+            if omv_data is not None:
+                gt["omv_depth"] = omv_data["depthmap"]
+                gt["omv_intrinsics"] = omv_data["camera_intrinsics"]
+                # Normalize camera poses to view-0-relative:
+                # the encoder makes pose_0 identity; GT must match.
+                omv_pose_abs = omv_data["camera_pose"]
+                gt["omv_camera_pose"] = torch.einsum(
+                    "bij,bnjk->bnik",
+                    torch.inverse(omv_pose_abs[:, 0:1, :, :]),
+                    omv_pose_abs,
+                )
 
         return [pred, gt]
 

@@ -226,6 +226,10 @@ class _DummyMillimeterManoLayer(torch.nn.Module):
             joints = joints + th_trans.unsqueeze(1)
         return SimpleNamespace(vertices=vertices, joints=joints)
 
+    def forward_rotmat(self, global_orient, hand_pose, betas, th_trans=None, **kwargs):
+        del global_orient, hand_pose, betas, kwargs
+        return self.forward(None, None, th_trans=th_trans)
+
 
 class Pi3XRerunExportTests(unittest.TestCase):
     def test_strip_invalid_gltf_semantics_removes_private_attributes(self) -> None:
@@ -492,6 +496,145 @@ class Pi3XRerunExportTests(unittest.TestCase):
             rtol=0,
             atol=1e-6,
         )
+
+    def test_export_gt_hand_mesh_supports_dense_bn_gt_without_owner_index(self) -> None:
+        fake_rr = _FakeRerun()
+
+        batch = [
+            {
+                "img": torch.full((1, 3, 4, 4), 0.5, dtype=torch.float32),
+                "depthmap": torch.ones(1, 4, 4, dtype=torch.float32),
+                "camera_pose": torch.eye(4).unsqueeze(0),
+                "hand": {
+                    "mask": torch.ones(1, 4, 4, dtype=torch.float32),
+                    "valid": torch.tensor([True]),
+                    "pose_mano": torch.cat([torch.tensor([[0.1, 0.0, 0.0]]), torch.zeros(1, 45)], dim=1),
+                    "hand_transl": torch.tensor([[0.01, 0.02, 0.03]], dtype=torch.float32),
+                    "mano_betas": torch.zeros(1, 10, dtype=torch.float32),
+                    "mano_side": ["right"],
+                },
+                "object": {
+                    "grasped_object_id": torch.tensor([1]),
+                    "mask": torch.ones(1, 4, 4, dtype=torch.float32),
+                    "valid": torch.tensor([False]),
+                },
+                "object_multiview": {
+                    "template_vertices": torch.tensor(
+                        [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]],
+                        dtype=torch.float32,
+                    ),
+                    "normalization_center": torch.zeros(3, dtype=torch.float32),
+                    "normalization_scale": torch.tensor([1.0], dtype=torch.float32),
+                },
+            }
+        ]
+        gt = {
+            "scene_scale": torch.tensor([1.0], dtype=torch.float32),
+            "local_points": torch.zeros(1, 1, 4, 4, 3, dtype=torch.float32),
+            "valid_masks": torch.ones(1, 1, 4, 4, dtype=torch.bool),
+            "hand_valid": torch.tensor([[True]], dtype=torch.bool),
+            "hand_is_right": torch.tensor([[True]], dtype=torch.bool),
+            "hand_global_orient_rotmat": torch.eye(3, dtype=torch.float32).view(1, 1, 1, 3, 3),
+            "hand_pose_rotmat": torch.eye(3, dtype=torch.float32).view(1, 1, 1, 3, 3).repeat(1, 1, 15, 1, 1),
+            "hand_mano_betas": torch.zeros(1, 1, 10, dtype=torch.float32),
+            "hand_transl": torch.tensor([[[0.01, 0.02, 0.03]]], dtype=torch.float32),
+            "hand_scale": torch.tensor([[[1.0]]], dtype=torch.float32),
+            "hand_joints_3d": torch.tensor([[[[0.01, 0.02, 0.03]]]], dtype=torch.float32),
+        }
+        gt["local_points"][0, 0, ..., 2] = 1.0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "sample.rrd"
+            with patch("pi3.visualization.pi3x_rerun_export._load_rerun", return_value=fake_rr), patch(
+                "pi3.visualization.pi3x_rerun_export._load_textured_object_mesh",
+                side_effect=_fake_load_textured_object_mesh,
+            ):
+                export_pi3x_rerun_sample(
+                    output_path=output_path,
+                    batch=batch,
+                    pred=None,
+                    gt=gt,
+                    sample_index=0,
+                    data_root="/tmp/dummy",
+                    mano_layer=_DummyManoLayer(),
+                    item_name="pi3x_train_sample",
+                )
+
+        logged_entities = [entity for entity, _ in fake_rr.logged]
+        self.assertIn("world/gt_hand_mesh", logged_entities)
+        self.assertIn("world/gt_hand_joints", logged_entities)
+
+    def test_export_gt_hand_mesh_supports_dense_bn_gt_with_sample_level_hand_scale(self) -> None:
+        fake_rr = _FakeRerun()
+
+        batch = []
+        for _ in range(2):
+            batch.append(
+                {
+                    "img": torch.full((1, 3, 4, 4), 0.5, dtype=torch.float32),
+                    "depthmap": torch.ones(1, 4, 4, dtype=torch.float32),
+                    "camera_pose": torch.eye(4).unsqueeze(0),
+                    "hand": {
+                        "mask": torch.ones(1, 4, 4, dtype=torch.float32),
+                        "valid": torch.tensor([True]),
+                        "pose_mano": torch.cat([torch.tensor([[0.1, 0.0, 0.0]]), torch.zeros(1, 45)], dim=1),
+                        "hand_transl": torch.tensor([[0.01, 0.02, 0.03]], dtype=torch.float32),
+                        "mano_betas": torch.zeros(1, 10, dtype=torch.float32),
+                        "mano_side": ["right"],
+                    },
+                    "object": {
+                        "grasped_object_id": torch.tensor([1]),
+                        "mask": torch.ones(1, 4, 4, dtype=torch.float32),
+                        "valid": torch.tensor([False]),
+                    },
+                    "object_multiview": {
+                        "template_vertices": torch.tensor(
+                            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]],
+                            dtype=torch.float32,
+                        ),
+                        "normalization_center": torch.zeros(3, dtype=torch.float32),
+                        "normalization_scale": torch.tensor([1.0], dtype=torch.float32),
+                    },
+                }
+            )
+        gt = {
+            "scene_scale": torch.tensor([1.0], dtype=torch.float32),
+            "local_points": torch.zeros(1, 2, 4, 4, 3, dtype=torch.float32),
+            "valid_masks": torch.ones(1, 2, 4, 4, dtype=torch.bool),
+            "hand_valid": torch.tensor([[True, True]], dtype=torch.bool),
+            "hand_is_right": torch.tensor([[True, True]], dtype=torch.bool),
+            "hand_global_orient_rotmat": torch.eye(3, dtype=torch.float32).view(1, 1, 1, 3, 3).repeat(1, 2, 1, 1, 1),
+            "hand_pose_rotmat": torch.eye(3, dtype=torch.float32).view(1, 1, 1, 3, 3).repeat(1, 2, 15, 1, 1),
+            "hand_mano_betas": torch.zeros(1, 2, 10, dtype=torch.float32),
+            "hand_transl": torch.tensor([[[0.01, 0.02, 0.03], [0.04, 0.05, 0.06]]], dtype=torch.float32),
+            "hand_scale": torch.tensor([[[1.0]]], dtype=torch.float32),
+            "hand_joints_3d": torch.tensor([[[[0.01, 0.02, 0.03]], [[0.04, 0.05, 0.06]]]], dtype=torch.float32),
+        }
+        gt["local_points"][0, :, ..., 2] = 1.0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "sample.rrd"
+            with patch("pi3.visualization.pi3x_rerun_export._load_rerun", return_value=fake_rr), patch(
+                "pi3.visualization.pi3x_rerun_export._load_textured_object_mesh",
+                side_effect=_fake_load_textured_object_mesh,
+            ):
+                export_pi3x_rerun_sample(
+                    output_path=output_path,
+                    batch=batch,
+                    pred=None,
+                    gt=gt,
+                    sample_index=0,
+                    data_root="/tmp/dummy",
+                    mano_layer=_DummyManoLayer(),
+                    item_name="pi3x_train_sample",
+                )
+
+        gt_hand_meshes = [
+            payload
+            for entity, payload in fake_rr.logged
+            if entity == "world/gt_hand_mesh" and payload.__class__.__name__ == "Mesh3D"
+        ]
+        self.assertEqual(len(gt_hand_meshes), 2)
 
     def test_export_logs_predicted_hand_and_object_meshes_without_display_scale(self) -> None:
         fake_rr = _FakeRerun()

@@ -1,0 +1,41 @@
+# @package _global_
+
+train_dataset:
+  _target_: datasets.forehoi_dataset.ForeHOIDataset
+  data_root: ${oc.env:FOREHOI_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/forehoi/pi3x_raw}
+  object_multiview_root: ${oc.env:FOREHOI_OBJECT_MULTIVIEW_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/forehoi/object_multiview_pyrender}
+  include_object_multiview_payload: false
+  use_crop: false
+  mode: train
+  z_far: 0
+  frame_num: 8
+  resolution:
+    - [504, 504]
+  shuffle: true
+
+train_dataloader:
+  drop_last: true
+  shuffle: true
+  persistent_workers: false
+  multiprocessing_context: null
+  prefetch_factor: 1
+
+test_dataset:
+  _target_: datasets.forehoi_dataset.ForeHOIDataset
+  data_root: ${oc.env:FOREHOI_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/forehoi/pi3x_raw}
+  object_multiview_root: ${oc.env:FOREHOI_OBJECT_MULTIVIEW_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/forehoi/object_multiview_pyrender}
+  include_object_multiview_payload: false
+  use_crop: false
+  mode: test
+  z_far: 0
+  frame_num: 8
+  resolution:
+    - [504, 504]
+  shuffle: false
+
+test_dataloader:
+  drop_last: false
+  shuffle: false
+  persistent_workers: false
+  multiprocessing_context: null
+  prefetch_factor: 1

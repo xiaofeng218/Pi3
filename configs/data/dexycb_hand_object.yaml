@@ -13,7 +13,7 @@ train_dataset:
   frame_num: 8
   vertex_sample_count: ${object.vertex_sample_count}
   min_valid_ratio: null
-  max_frame_gap: 5
+  max_frame_gap: 10
   resolution:
     - [504, 504]
   shuffle: true
@@ -38,7 +38,7 @@ test_dataset:
   frame_num: 8
   vertex_sample_count: ${object.vertex_sample_count}
   min_valid_ratio: null
-  max_frame_gap: 5
+  max_frame_gap: 10
   resolution:
     - [504, 504]
   shuffle: false

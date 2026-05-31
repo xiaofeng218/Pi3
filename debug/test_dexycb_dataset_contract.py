@@ -247,7 +247,12 @@ def main() -> None:
         assert len(train_dataset) == 8, len(train_dataset)
         assert len(valid_dataset) == 2, len(valid_dataset)
 
-        sample = train_dataset[0]
+        with mock.patch.object(
+            DexYCBDataset,
+            "_decode_hand_pose_gt_rotmats",
+            return_value=(np.eye(3, dtype=np.float32)[None, :, :], np.repeat(np.eye(3, dtype=np.float32)[None, :, :], 15, axis=0)),
+        ):
+            sample = train_dataset[0]
         assert set(sample.keys()) == {"views", "object_multiview_payload"}
         assert len(sample["views"]) == 3
         assert set(sample["object_multiview_payload"].keys()) == {"img", "depthmap", "camera_intrinsics", "camera_pose"}
@@ -261,11 +266,14 @@ def main() -> None:
             assert "hand" in view
             assert view["hand"]["mask"].shape == view["depthmap"].shape
             assert view["hand"]["pose_mano"].shape == (48,)
+            assert view["hand"]["pose_repr"] in {"mano_full_aa", "mano_pca_coeffs"}
             assert view["hand"]["hand_transl"].shape == (3,)
             assert view["hand"]["joints_3d_cam"].shape == (21, 3)
             assert view["hand"]["joints_2d"].shape == (21, 2)
             assert view["hand"]["mano_betas"].shape == (10,)
             assert view["hand"]["mano_side"] == "right"
+            assert view["hand"]["global_orient_rotmat_gt"].shape == (1, 3, 3)
+            assert view["hand"]["pose_rotmat_gt"].shape == (15, 3, 3)
             assert isinstance(bool(view["hand"]["valid"]), bool)
             if view["hand"]["valid"]:
                 assert np.isfinite(view["hand"]["joints_2d"]).all()
@@ -275,8 +283,8 @@ def main() -> None:
             assert "camera_intrinsics" not in view["object_multiview"]
             assert "camera_pose" not in view["object_multiview"]
             assert "pts3d" not in view["object_multiview"]
-            assert view["object_multiview"]["template_vertices"].shape[1] == 3
             assert view["object_multiview"]["normalization_center"].shape == (3,)
+            assert np.asarray(view["object_multiview"]["normalization_scale"]).shape in {(), (1,)}
             assert "grasped_object_id" not in view["object_multiview"]
             assert "grasped_object_mask" not in view["object_multiview"]
             assert "grasped_object_pose_obj2cam" not in view["object_multiview"]
@@ -287,6 +295,7 @@ def main() -> None:
             assert view["object"]["mask"].shape == view["depthmap"].shape
             assert view["object"]["pose_obj2cam"].shape == (4, 4)
             assert isinstance(bool(view["object"]["valid"]), bool)
+            assert view["object"]["scale_meta"]["canonical_to_target_scale"] > 0
 
         loader = DataLoader(
             dataset=train_dataset,
@@ -295,7 +304,12 @@ def main() -> None:
             num_workers=0,
             collate_fn=unified_collate_fn,
         )
-        batch = next(iter(loader))
+        with mock.patch.object(
+            DexYCBDataset,
+            "_decode_hand_pose_gt_rotmats",
+            return_value=(np.eye(3, dtype=np.float32)[None, :, :], np.repeat(np.eye(3, dtype=np.float32)[None, :, :], 15, axis=0)),
+        ):
+            batch = next(iter(loader))
         assert set(batch.keys()) == {"views", "object_multiview_payload"}
         assert len(batch["views"]) == 3
         assert batch["object_multiview_payload"]["img"].shape[0] == 2
@@ -304,7 +318,6 @@ def main() -> None:
         assert "camera_intrinsics" not in batch["views"][0]["object_multiview"]
         assert "camera_pose" not in batch["views"][0]["object_multiview"]
         assert "pts3d" not in batch["views"][0]["object_multiview"]
-        assert batch["views"][0]["object_multiview"]["template_vertices"].shape[0] == 2
         assert "grasped_object_mask" not in batch["views"][0]["object_multiview"]
         assert batch["views"][0]["object"]["mask"].shape == (2, 224, 224)
 
@@ -324,7 +337,12 @@ def main() -> None:
             frame_num=3,
             include_object_multiview_payload=True,
         )
-        payload_sample = payload_dataset[0]
+        with mock.patch.object(
+            DexYCBDataset,
+            "_decode_hand_pose_gt_rotmats",
+            return_value=(np.eye(3, dtype=np.float32)[None, :, :], np.repeat(np.eye(3, dtype=np.float32)[None, :, :], 15, axis=0)),
+        ):
+            payload_sample = payload_dataset[0]
         payload_mv = payload_sample["views"][0]["object_multiview"]
         assert payload_mv["img"].shape == (8, 3, 224, 224)
         assert payload_mv["depthmap"].shape == (8, 224, 224)

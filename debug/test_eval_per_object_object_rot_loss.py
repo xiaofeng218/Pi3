@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -14,7 +16,9 @@ if str(REPO_ROOT) not in sys.path:
 from debug.eval_per_object_object_rot_loss import (  # noqa: E402
     _extract_object_ids,
     _extract_views_batch_for_rerun,
+    _resolve_eval_loader,
     _maybe_wrap_hydrate_object_payload_to_device,
+    _build_trainer,
 )
 
 
@@ -23,6 +27,38 @@ class _DummyTrainer:
 
 
 class EvalPerObjectObjectRotLossTests(unittest.TestCase):
+    def test_resolve_eval_loader_uses_train_loader_for_train_split(self) -> None:
+        trainer = SimpleNamespace(train_loader="train_loader", test_loader="test_loader")
+
+        loader = _resolve_eval_loader(trainer, split="train")
+
+        self.assertEqual(loader, "train_loader")
+
+    def test_build_trainer_overrides_dataset_modes_for_requested_split(self) -> None:
+        fake_cfg = SimpleNamespace(
+            extras=SimpleNamespace(print_config=True),
+            work_dir="",
+            working_dir="",
+        )
+
+        with (
+            mock.patch("debug.eval_per_object_object_rot_loss.compose", return_value=fake_cfg) as compose_mock,
+            mock.patch("debug.eval_per_object_object_rot_loss.initialize_config_dir") as init_mock,
+            mock.patch("debug.eval_per_object_object_rot_loss.OmegaConf.load"),
+            mock.patch("debug.eval_per_object_object_rot_loss.open_dict") as open_dict_mock,
+            mock.patch("debug.eval_per_object_object_rot_loss.Pi3XTrainer"),
+        ):
+            init_mock.return_value.__enter__.return_value = None
+            init_mock.return_value.__exit__.return_value = None
+            open_dict_mock.return_value.__enter__.return_value = fake_cfg
+            open_dict_mock.return_value.__exit__.return_value = None
+
+            _build_trainer(subject="20200709-subject-01", output_dir=REPO_ROOT / "tmp" / "unit-test", split="train")
+
+        overrides = compose_mock.call_args.kwargs["overrides"]
+        self.assertIn("train_dataset.mode=train", overrides)
+        self.assertIn("test_dataset.mode=train", overrides)
+
     def test_wrap_hydrate_payload_is_noop_when_trainer_uses_new_batch_api(self) -> None:
         trainer = _DummyTrainer()
 

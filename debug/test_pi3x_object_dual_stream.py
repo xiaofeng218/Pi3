@@ -31,12 +31,16 @@ class _MixingBlock(nn.Module):
 
 
 class _MixingCrossBlock(nn.Module):
-    def forward(self, x, y=None, xpos=None, ypos=None, enable_self_attn=True, enable_cross_attn=True):
+    def forward(self, x, y=None, xpos=None, ypos=None, enable_self_attn=True, enable_cross_attn=True, cross_alpha=None):
+        del xpos, ypos
         x_context = x.mean(dim=1, keepdim=True)
         out = x + x_context if enable_self_attn else x
         if enable_cross_attn and y is not None:
             y_context = y.mean(dim=1, keepdim=True)
-            out = out + y_context
+            if cross_alpha is not None:
+                out = out + cross_alpha.to(dtype=out.dtype) * y_context
+            else:
+                out = out + y_context
         return out
 
 
@@ -44,27 +48,27 @@ class _SpyObjectQueryAdapter(nn.Module):
     def __init__(self, token_dim: int = 1024) -> None:
         super().__init__()
         self.token_dim = token_dim
+        self.crop_hw = (4, 12)
         self.calls: list[dict[str, torch.Tensor | tuple[int, int]]] = []
         self.valid_token = nn.Parameter(torch.full((1, 1, 1, token_dim), 2.0), requires_grad=False)
         self.empty_token = nn.Parameter(torch.full((1, 1, 1, token_dim), -3.0), requires_grad=False)
 
-    def forward(self, rgb_patch_tokens, grasped_object_mask, grasped_object_valid, image_hw):
+    def forward(self, imgs, grasped_object_mask, grasped_object_valid, encoder):
         self.calls.append(
             {
-                "rgb_patch_tokens": rgb_patch_tokens.detach().clone(),
+                "imgs": imgs.detach().clone(),
                 "grasped_object_mask": grasped_object_mask.detach().clone(),
                 "grasped_object_valid": grasped_object_valid.detach().clone(),
-                "image_hw": image_hw,
+                "encoder": encoder,
             }
         )
         batch, num_views = grasped_object_valid.shape
-        object_query = self.empty_token.expand(batch, num_views, 1, self.token_dim).clone()
+        object_query = self.empty_token.expand(batch, num_views, 3, self.token_dim).clone()
         object_query[grasped_object_valid] = self.valid_token[0, 0, 0]
-        object_query_pos = torch.zeros(batch, num_views, 1, 2, dtype=torch.long, device=grasped_object_valid.device)
         return {
-            "object_query": object_query,
-            "object_query_pos": object_query_pos,
-            "object_valid": grasped_object_valid,
+            "object_tokens": object_query,
+            "object_valid_mask": grasped_object_valid,
+            "crop_boxes": torch.zeros(batch, num_views, 4, device=grasped_object_valid.device),
         }
 
 
@@ -73,9 +77,9 @@ class _SpyObjectPoseHead(nn.Module):
         super().__init__()
         self.inputs: list[torch.Tensor] = []
 
-    def forward(self, object_query_feat: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, object_query_feat: torch.Tensor, valid_mask=None) -> dict[str, torch.Tensor]:
         self.inputs.append(object_query_feat.detach().clone())
-        summary = object_query_feat.mean(dim=-1, keepdim=True)
+        summary = object_query_feat.mean(dim=(2, 3), keepdim=False).unsqueeze(-1)
         trans_dir = torch.nn.functional.normalize(summary.expand(-1, -1, 3).clone(), dim=-1)
         trans_scale = torch.exp(summary)
         return {
@@ -176,8 +180,6 @@ class Pi3XObjectDualStreamTests(unittest.TestCase):
                 object_valid,
             )
         )
-        self.assertEqual(object_query_adapter.calls[0]["image_hw"], (8, 8))
-        self.assertEqual(object_query_adapter.calls[1]["image_hw"], (8, 8))
         self.assertEqual(len(object_pose_head.inputs), 2)
         self.assertFalse(torch.allclose(object_pose_head.inputs[0][0, 0], object_pose_head.inputs[1][0, 0]))
         self.assertTrue(torch.allclose(object_pose_head.inputs[0][0, 1], object_pose_head.inputs[1][0, 1]))

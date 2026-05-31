@@ -6,38 +6,32 @@ defaults:
 
 name: pi3x_overfit
 
-# Dataset: overfit on two fixed tracks with 3 frames per sample:
-# one right-hand track and one left-hand track.
+# Dataset: overfit on a single ForeHOI shard with 3 frames per sample.
 train_dataset:
-  data_root: ${oc.env:DEXYCB_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/dexycb}
+  _target_: datasets.forehoi_dataset.ForeHOIDataset
+  data_root: ${oc.env:FOREHOI_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/forehoi/pi3x_raw}
+  object_multiview_root: ${oc.env:FOREHOI_OBJECT_MULTIVIEW_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/forehoi/object_multiview_pyrender}
+  max_sequences: 1
+  include_object_multiview_payload: false
+  use_crop: false
+  mode: train
+  z_far: 0
   frame_num: 3
-  selected_tracks:
-    right:
-      subject: 20200709-subject-01
-      sequence: "20200709_141754"
-      camera: "836212060125"
-    left:
-      subject: 20200709-subject-01
-      sequence: "20200709_141931"
-      camera: "836212060125"
   fix_epoch_seed: true
   resolution:
     - [224, 224]
 
 # Ignored when test.use_train_loader=true; kept mirrored for readability.
 test_dataset:
-  data_root: ${oc.env:DEXYCB_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/dexycb}
+  _target_: datasets.forehoi_dataset.ForeHOIDataset
+  data_root: ${oc.env:FOREHOI_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/forehoi/pi3x_raw}
+  object_multiview_root: ${oc.env:FOREHOI_OBJECT_MULTIVIEW_ROOT,${oc.env:PI3_DATA_ROOT,data}/dataset/forehoi/object_multiview_pyrender}
+  max_sequences: 1
+  include_object_multiview_payload: false
+  use_crop: false
   mode: train
+  z_far: 0
   frame_num: 3
-  selected_tracks:
-    right:
-      subject: 20200709-subject-01
-      sequence: "20200709_141754"
-      camera: "836212060125"
-    left:
-      subject: 20200709-subject-01
-      sequence: "20200709_141931"
-      camera: "836212060125"
   fix_epoch_seed: true
   resolution:
     - [224, 224]
@@ -57,8 +51,8 @@ model:
 
 # Training parameters for overfitting
 train:
-  image_num_range: [3, 3]
-  max_img_per_gpu: 3
+  image_num_range: [6, 6]
+  max_img_per_gpu: 6
   num_epoch: 10
   iters_per_epoch: 100
   batch_size: 1
@@ -72,7 +66,7 @@ train:
 # Test
 test:
   use_train_loader: true
-  image_num_range: [3, 3]
+  image_num_range: [6, 6]
   iters_per_test: 2
   batch_size: 1
   num_workers: 0

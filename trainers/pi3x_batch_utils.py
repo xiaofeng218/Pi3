@@ -74,10 +74,6 @@ def build_scene_inputs_from_views_batch(batch: dict[str, Any]) -> dict[str, Any]
     poses = _stack_view_field(views, lambda view: view["camera_pose"], dtype=torch.float32, device=device)
 
     hand_masks = _stack_view_field(views, lambda view: view["hand"]["mask"], dtype=torch.float32, device=device)
-    batch_size = imgs.shape[0]
-    num_views = len(views)
-    hand_owner_index = torch.zeros((batch_size, num_views, 3), dtype=torch.long, device=device)
-    hand_owner_index[:, :, 1] = torch.arange(num_views, dtype=torch.long, device=device).view(1, num_views)
     hand_is_right = torch.stack(
         [_sides_to_bool_tensor(view["hand"]["mano_side"], device=device) for view in views],
         dim=1,
@@ -102,7 +98,6 @@ def build_scene_inputs_from_views_batch(batch: dict[str, Any]) -> dict[str, Any]
         "intrinsics": intrinsics,
         "poses": poses,
         "hand_masks": hand_masks,
-        "hand_owner_index": hand_owner_index,
         "hand_is_right": hand_is_right,
         "object_masks": object_masks,
         "object_valid": object_valid,
@@ -113,15 +108,25 @@ def build_scene_inputs_from_views_batch(batch: dict[str, Any]) -> dict[str, Any]
 def build_gt_metric_from_views_batch(batch: dict[str, Any]) -> dict[str, Any]:
     views = batch["views"]
     device = _infer_batch_device(batch)
-    num_views = len(views)
-    batch_size = _as_tensor(views[0]["img"], device=device).shape[0]
-    hand_owner_index = torch.zeros((batch_size, num_views, 3), dtype=torch.long, device=device)
-    hand_owner_index[:, :, 1] = torch.arange(num_views, dtype=torch.long, device=device).view(1, num_views)
-
     object_multiview_shared = views[0]["object_multiview"]
+    object_scale_values = []
+    for view in views:
+        scale_meta = view["object"].get("scale_meta", {})
+        object_scale_values.append(
+            scale_meta.get(
+                "canonical_to_target_scale",
+                scale_meta.get("canonical_to_scene_metric", view["object_multiview"]["normalization_scale"]),
+            )
+        )
     return {
         "hand_valid": _stack_view_field(views, lambda view: view["hand"]["valid"], dtype=torch.bool, device=device),
         "hand_pose_coeffs": _stack_view_field(views, lambda view: view["hand"]["pose_mano"], dtype=torch.float32, device=device),
+        "hand_global_orient_rotmat_gt": _stack_view_field(
+            views, lambda view: view["hand"]["global_orient_rotmat_gt"], dtype=torch.float32, device=device
+        ),
+        "hand_pose_rotmat_gt": _stack_view_field(
+            views, lambda view: view["hand"]["pose_rotmat_gt"], dtype=torch.float32, device=device
+        ),
         "hand_transl": _stack_view_field(views, lambda view: view["hand"]["hand_transl"], dtype=torch.float32, device=device),
         "hand_mano_betas": _stack_view_field(views, lambda view: view["hand"]["mano_betas"], dtype=torch.float32, device=device),
         "hand_joints_3d": _stack_view_field(views, lambda view: view["hand"]["joints_3d_cam"], dtype=torch.float32, device=device),
@@ -131,13 +136,12 @@ def build_gt_metric_from_views_batch(batch: dict[str, Any]) -> dict[str, Any]:
             [_sides_to_bool_tensor(view["hand"]["mano_side"], device=device) for view in views],
             dim=1,
         ),
-        "hand_owner_index": hand_owner_index,
         "object_valid": _stack_view_field(views, lambda view: view["object"]["valid"], dtype=torch.bool, device=device),
         "object_pose_obj2cam": _stack_view_field(views, lambda view: view["object"]["pose_obj2cam"], dtype=torch.float32, device=device),
         "object_camera_intrinsics": _stack_view_field(views, lambda view: view["camera_intrinsics"], dtype=torch.float32, device=device),
-        "object_template_vertices": _as_tensor(object_multiview_shared["template_vertices"], dtype=torch.float32, device=device),
         "object_normalization_center": _as_tensor(object_multiview_shared["normalization_center"], dtype=torch.float32, device=device),
         "object_normalization_scale": _as_tensor(object_multiview_shared["normalization_scale"], dtype=torch.float32, device=device),
+        "object_scale_canonical_to_target": _as_tensor(object_scale_values, dtype=torch.float32, device=device),
     }
 
 

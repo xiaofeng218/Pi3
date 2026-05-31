@@ -3,8 +3,8 @@
 trainer: trainers.pi3x_trainer.Pi3XTrainer
 
 train:
-  image_num_range: [12, 12]
-  max_img_per_gpu: 12
+  image_num_range: [6, 6]
+  max_img_per_gpu: 18
   num_workers: 2
   pin_memory: true
   batch_size: 1
@@ -59,9 +59,9 @@ vis:
   item_name: pi3x_train_sample
 
 test:
-  image_num_range: [12, 12]
+  image_num_range: [6, 6]
   num_workers: 2
   pin_memory: true
   batch_size: 1
   print_freq: 10
-  iters_per_test: 1
+  iters_per_test: -1

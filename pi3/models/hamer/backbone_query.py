@@ -43,6 +43,7 @@ class HaMeRBackbone(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.vit = create_backbone(cfg)
+        self.context_dim = int(getattr(self.vit, "embed_dim", getattr(self.vit, "num_features", 1280)))
 
         mano_head_cfg = cfg.MODEL.MANO_HEAD
         joint_rep_type = _cfg_get(mano_head_cfg, "JOINT_REP", "6d")
@@ -89,4 +90,4 @@ class HaMeRBackbone(nn.Module):
         token_out = self.transformer(token, context=context)
         query = token_out.squeeze(1)
         betas = self.decshape(query) + self.init_betas.expand(crops.shape[0], -1).to(device=query.device, dtype=query.dtype)
-        return query, betas
+        return context, betas

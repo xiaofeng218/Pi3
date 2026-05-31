@@ -180,6 +180,32 @@ def estimate_scene_scale_from_depth(
     return torch.stack(scale, dim=0)
 
 
+def _unproject_depth_to_camera_local(
+    depthmap: torch.Tensor,
+    intrinsics: torch.Tensor,
+) -> torch.Tensor:
+    """Unproject a depth map to camera-local 3D points.
+
+    Args:
+        depthmap: (..., H, W) depth values.
+        intrinsics: (..., 3, 3) camera intrinsics matrices.
+
+    Returns:
+        (..., H, W, 3) camera-local 3D points.
+    """
+    *prefix, H, W = depthmap.shape
+    device = depthmap.device
+    pix_u, pix_v = torch.meshgrid(
+        torch.arange(W, device=device, dtype=torch.float32),
+        torch.arange(H, device=device, dtype=torch.float32),
+        indexing='xy',
+    )
+    pix = torch.stack([pix_u, pix_v, torch.ones_like(pix_u)], dim=-1)  # (H, W, 3)
+    inv_K = torch.inverse(intrinsics)                                    # (..., 3, 3)
+    rays = torch.einsum('...ij, hwj -> ...hwi', inv_K, pix)             # (..., H, W, 3)
+    return rays * depthmap.unsqueeze(-1)
+
+
 @dataclass
 class HandObjectLossDetails:
     hand_transl_scale_gt: torch.Tensor | None = None
@@ -208,6 +234,8 @@ class HandObjectLoss(nn.Module):
         "object_rot_loss",
         "object_transl_loss",
         "object_scale_loss",
+        "omv_point_loss",
+        "omv_camera_loss",
     )
 
     def __init__(
@@ -227,6 +255,8 @@ class HandObjectLoss(nn.Module):
         object_transl_weight: float = 1.0,
         object_scale_weight: float = 0.1,
         object_2d_weight: float = 1.0,
+        omv_point_weight: float = 0.0,
+        omv_camera_weight: float = 0.0,
         hand_discriminator_ckpt: str | None = None,
         hand_discriminator: nn.Module | None = None,
         debug_hand_joints_vis_enabled: bool = False,
@@ -246,6 +276,8 @@ class HandObjectLoss(nn.Module):
         self.object_rot_weight = float(object_rot_weight)
         self.object_transl_weight = float(object_transl_weight)
         self.object_scale_weight = float(object_scale_weight)
+        self.omv_point_weight = float(omv_point_weight)
+        self.omv_camera_weight = float(omv_camera_weight)
         self.debug_hand_joints_vis_enabled = bool(debug_hand_joints_vis_enabled)
         self.debug_hand_joints_vis_dir = None if debug_hand_joints_vis_dir in (None, "") else Path(debug_hand_joints_vis_dir)
         self.debug_hand_joints_vis_max_exports = int(debug_hand_joints_vis_max_exports)
@@ -362,42 +394,30 @@ class HandObjectLoss(nn.Module):
         if not valid_mask.any():
             return
 
-        valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
-        target_index = valid_indices[per_sample_joint_loss[valid_mask].argmax()].item()
+        flat_pred_joints = pred_joints.reshape(-1, pred_joints.shape[-2], pred_joints.shape[-1])
+        flat_gt_joints = gt_joints.reshape(-1, gt_joints.shape[-2], gt_joints.shape[-1])
+        flat_joint_loss = per_sample_joint_loss.reshape(-1)
+        flat_valid_mask = valid_mask.reshape(-1)
+        valid_indices = torch.nonzero(flat_valid_mask, as_tuple=False).squeeze(-1)
+        target_index = valid_indices[flat_joint_loss[flat_valid_mask].argmax()].item()
         side_name = "unknown"
-        if hand_is_right is not None and hand_is_right.numel() > target_index:
-            side_name = "right" if bool(hand_is_right[target_index].item()) else "left"
+        if hand_is_right is not None:
+            flat_hand_is_right = hand_is_right.reshape(-1)
+            if flat_hand_is_right.numel() > target_index:
+                side_name = "right" if bool(flat_hand_is_right[target_index].item()) else "left"
         output_path = self.debug_hand_joints_vis_dir / (
             f"hand_joint_loss_{self._debug_hand_joints_vis_export_count:04d}_{side_name}_idx{target_index:03d}.rrd"
         )
         export_hand_joint_loss_rerun(
             output_path=output_path,
-            pred_joints=pred_joints[target_index],
-            gt_joints=gt_joints[target_index],
+            pred_joints=flat_pred_joints[target_index],
+            gt_joints=flat_gt_joints[target_index],
             sample_name=f"hand_joint_loss_{side_name}_{self._debug_hand_joints_vis_export_count:04d}",
         )
         self._debug_hand_joints_vis_export_count += 1
 
     def _project_hand_joints_2d(self, pred_joints_3d: torch.Tensor, intrinsics: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return project_points_cam_to_image_torch(pred_joints_3d, intrinsics)
-
-    def _build_pred_object_vertices(
-        self,
-        pred_rot6d: torch.Tensor,
-        pred_trans: torch.Tensor,
-        pred_scale: torch.Tensor,
-        template_vertices: torch.Tensor,
-        normalization_center: torch.Tensor,
-        normalization_scale: torch.Tensor,
-    ) -> torch.Tensor:
-        pred_rot = rot6d_to_rotmat(pred_rot6d.reshape(-1, 6)).reshape(*pred_rot6d.shape[:-1], 3, 3)
-        template = template_vertices.to(dtype=pred_trans.dtype, device=pred_trans.device)
-        center = normalization_center.to(dtype=template.dtype, device=template.device).reshape(-1, 1, 1, 3)
-        norm_scale = normalization_scale.to(dtype=template.dtype, device=template.device).reshape(-1, 1, 1, 1).clamp_min(1e-6)
-        normalized = (template.unsqueeze(1) - center) / norm_scale
-        scaled = normalized * pred_scale.unsqueeze(-2)
-        rotated = torch.matmul(scaled, pred_rot.transpose(-1, -2))
-        return rotated + pred_trans.unsqueeze(-2)
 
     def forward(self, pred: dict[str, Any], gt: dict[str, Any]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         total = torch.zeros((), device=next((v.device for v in pred.values() if torch.is_tensor(v)), torch.device("cpu")))
@@ -418,11 +438,7 @@ class HandObjectLoss(nn.Module):
             hand_transl = gt["hand_transl"]
             hand_scale = gt.get("hand_scale", None)
             if hand_scale is None:
-                hand_owner_index = gt.get("hand_owner_index", None)
-                if hand_owner_index is not None:
-                    hand_scale = scene_scale[hand_owner_index[:, 0]].view(-1, 1)
-                else:
-                    hand_scale = scene_scale.view(*scene_scale.shape, *([1] * (hand_transl.ndim - scene_scale.ndim)))
+                hand_scale = scene_scale.view(*scene_scale.shape, *([1] * (hand_transl.ndim - scene_scale.ndim)))
 
             hand_transl_loss = F.l1_loss(
                 pred["pred_hand_transl"], hand_transl, reduction="none"
@@ -616,6 +632,51 @@ class HandObjectLoss(nn.Module):
                 + self.object_transl_weight * object_transl_loss
                 + self.object_scale_weight * object_scale_loss
             )
-            
+
+        # --- OMV point loss ---
+        if (
+            self.omv_point_weight > 0
+            and "omv_local_points" in pred
+            and "omv_depth" in gt
+            and "omv_intrinsics" in gt
+        ):
+            valid = gt["omv_depth"] > 0
+            if valid.any():
+                pred_pts = pred["omv_local_points"]
+                gt_pts = _unproject_depth_to_camera_local(
+                    gt["omv_depth"], gt["omv_intrinsics"],
+                )
+                omv_point_loss = F.l1_loss(
+                    pred_pts[valid].float(),
+                    gt_pts[valid].float(),
+                )
+                details["omv_point_loss"] = _as_scalar(omv_point_loss)
+                weighted_details["omv_point_loss"] = _as_scalar(self.omv_point_weight * omv_point_loss)
+                total = total + self.omv_point_weight * omv_point_loss
+
+        # --- OMV camera loss ---
+        if (
+            self.omv_camera_weight > 0
+            and "omv_camera_poses" in pred
+            and "omv_camera_pose" in gt
+        ):
+            pred_pose = pred["omv_camera_poses"]          # (B, N_omv, 4, 4)
+            gt_pose   = gt["omv_camera_pose"]              # (B, N_omv, 4, 4)
+
+            pred_R, pred_t = pred_pose[..., :3, :3], pred_pose[..., :3, 3]
+            gt_R,   gt_t   = gt_pose[..., :3, :3],   gt_pose[..., :3, 3]
+
+            transl_loss = F.l1_loss(pred_t, gt_t)
+            # Angular rotation loss: R_pred^T @ R_gt, compute rotation angle from trace
+            R_diff = torch.matmul(pred_R.transpose(-1, -2), gt_R)
+            trace = R_diff.diagonal(dim1=-2, dim2=-1).sum(-1)
+            cos_angle = (trace - 1.0) / 2.0
+            rot_loss = torch.acos(cos_angle.clamp(-1.0 + 1e-6, 1.0 - 1e-6)).mean()
+
+            omv_camera_loss = transl_loss + rot_loss
+            details["omv_camera_loss"] = _as_scalar(omv_camera_loss)
+            weighted_details["omv_camera_loss"] = _as_scalar(self.omv_camera_weight * omv_camera_loss)
+            total = total + self.omv_camera_weight * omv_camera_loss
+
         details["_weighted_loss_details"] = weighted_details
         return total, details

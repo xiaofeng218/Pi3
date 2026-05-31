@@ -21,6 +21,9 @@ export PI3_DATASET_ROOT="${PI3_DATASET_ROOT:-$PI3_ASSET_ROOT/dataset}"
 export DEXYCB_ROOT="${DEXYCB_ROOT:-$PI3_DATASET_ROOT/dexycb}"
 export DEX_YCB_DIR="${DEX_YCB_DIR:-$DEXYCB_ROOT}"
 
+export FOREHOI_ROOT="${FOREHOI_ROOT:-$PI3_DATASET_ROOT/forehoi/pi3x_raw}"
+export FOREHOI_OBJECT_MULTIVIEW_ROOT="${FOREHOI_OBJECT_MULTIVIEW_ROOT:-$PI3_DATASET_ROOT/forehoi/object_multiview_pyrender}"
+
 export HAMER_CONFIG_FILE="${HAMER_CONFIG_FILE:-$PI3_REPO_ROOT/configs/hamer/model_config.yaml}"
 export HAMER_CACHE_DIR="${HAMER_CACHE_DIR:-$PI3_MODEL_ROOT/hamer/_DATA}"
 export HAMER_ENCODER_CKPT="${HAMER_ENCODER_CKPT:-$HAMER_CACHE_DIR/hamer_ckpts/checkpoints/hamer.ckpt}"

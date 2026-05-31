@@ -122,9 +122,10 @@ class HandObjectLossTests(unittest.TestCase):
         self.assertTrue(torch.allclose(scale, torch.tensor([3.0])))
 
     def test_hand_geometry_loss_is_root_relative(self) -> None:
-        loss = HandObjectLoss(mano_layer=_FakeMANO())
+        loss = HandObjectLoss()
         pred = {
             "pred_hand_transl_dir": torch.tensor([[0.0, 0.0, 1.0]]),
+            "pred_hand_transl": torch.tensor([[0.0, 0.0, 2.0]]),
             "pred_hand_transl_scale": torch.tensor([[2.0]]),
             "pred_hand_scale": torch.tensor([[4.0]]),
             "pred_hand_mano_params": {
@@ -138,23 +139,23 @@ class HandObjectLossTests(unittest.TestCase):
         targets = {
             "hand_valid": torch.tensor([True]),
             "scene_scale": torch.tensor([3.0]),
+            "hand_global_orient_rotmat": torch.eye(3).view(1, 1, 3, 3),
             "hand_transl": torch.tensor([[0.0, 0.0, 2.0]]),
-            "hand_pose_mano": torch.zeros(1, 48),
-            "hand_joints_3d_cam": torch.tensor([[[4.0, 4.0, 4.0]] + [[5.0, 6.0, 7.0]] * 20]),
+            "hand_pose_rotmat": torch.eye(3).view(1, 1, 3, 3).repeat(1, 15, 1, 1),
+            "hand_joints_3d": torch.tensor([[[4.0, 4.0, 4.0]] + [[5.0, 6.0, 7.0]] * 20]),
             "hand_mano_betas": torch.zeros(1, 10),
         }
 
         total, details = loss(pred, targets)
 
         self.assertTrue(torch.isfinite(total))
-        self.assertTrue(torch.allclose(details["hand_transl_scale_gt"], torch.tensor([[6.0]])))
-        self.assertTrue(torch.allclose(details["hand_scale_gt"], torch.tensor([[3.0]])))
         self.assertAlmostEqual(float(details["hand_joints_3d_loss"]), 0.0, places=6)
 
-    def test_hand_geometry_loss_uses_single_side_layer_without_legacy_fallback(self) -> None:
-        loss = HandObjectLoss(mano_layer=_FakeMANO())
+    def test_hand_geometry_loss_uses_dense_gt_without_legacy_fallback(self) -> None:
+        loss = HandObjectLoss()
         pred = {
             "pred_hand_transl_dir": torch.tensor([[0.0, 0.0, 1.0]]),
+            "pred_hand_transl": torch.tensor([[0.0, 0.0, 2.0]]),
             "pred_hand_transl_scale": torch.tensor([[2.0]]),
             "pred_hand_scale": torch.tensor([[4.0]]),
             "pred_hand_mano_params": {
@@ -168,9 +169,10 @@ class HandObjectLossTests(unittest.TestCase):
         targets = {
             "hand_valid": torch.tensor([True]),
             "scene_scale": torch.tensor([3.0]),
+            "hand_global_orient_rotmat": torch.eye(3).view(1, 1, 3, 3),
             "hand_transl": torch.tensor([[0.0, 0.0, 2.0]]),
-            "hand_pose_mano": torch.zeros(1, 48),
-            "hand_joints_3d_cam": torch.tensor([[[0.0, 0.0, 2.0]] + [[1.0, 2.0, 5.0]] * 20]),
+            "hand_pose_rotmat": torch.eye(3).view(1, 1, 3, 3).repeat(1, 15, 1, 1),
+            "hand_joints_3d": torch.tensor([[[0.0, 0.0, 2.0]] + [[1.0, 2.0, 5.0]] * 20]),
             "hand_mano_betas": torch.zeros(1, 10),
         }
 
@@ -179,33 +181,30 @@ class HandObjectLossTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(total))
         self.assertAlmostEqual(float(details["hand_joints_3d_loss"]), 0.0, places=6)
 
-    def test_hand_geometry_loss_uses_side_specific_gt_layer(self) -> None:
-        loss = HandObjectLoss(
-            mano_layer=torch.nn.ModuleDict({
-                "right": _SideMANO(sign=1.0),
-                "left": _SideMANO(sign=-1.0),
-            })
-        )
+    def test_hand_geometry_loss_respects_dense_hand_valid_mask(self) -> None:
+        loss = HandObjectLoss()
         pred = {
-            "pred_hand_transl_dir": torch.tensor([[0.0, 0.0, 1.0]]),
-            "pred_hand_transl_scale": torch.tensor([[2.0]]),
-            "pred_hand_scale": torch.tensor([[4.0]]),
+            "pred_hand_transl_dir": torch.tensor([[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]]),
+            "pred_hand_transl": torch.tensor([[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]),
+            "pred_hand_transl_scale": torch.tensor([[[2.0], [2.0]]]),
+            "pred_hand_scale": torch.tensor([[[4.0], [4.0]]]),
             "pred_hand_mano_params": {
-                "global_orient": torch.eye(3).view(1, 1, 3, 3),
-                "hand_pose": torch.eye(3).view(1, 1, 3, 3).repeat(1, 15, 1, 1),
-                "betas": torch.zeros(1, 10),
+                "global_orient": torch.eye(3).view(1, 1, 1, 3, 3).repeat(1, 2, 1, 1, 1),
+                "hand_pose": torch.eye(3).view(1, 1, 1, 3, 3).repeat(1, 2, 15, 1, 1),
+                "betas": torch.zeros(1, 2, 10),
             },
-            "pred_hand_joints_3d": torch.tensor([[[-1.0, 0.0, 0.0]] + [[-2.0, 0.0, 0.0]] * 20]),
-            "pred_hand_vertices": torch.tensor([[[-1.0, 0.0, 0.0]] + [[-2.0, 0.0, 0.0]] * 777]),
+            "pred_hand_joints_3d": torch.tensor([[[[-1.0, 0.0, 0.0]] + [[-2.0, 0.0, 0.0]] * 20, [[99.0, 0.0, 0.0]] + [[99.0, 0.0, 0.0]] * 20]]),
+            "pred_hand_vertices": torch.tensor([[[[-1.0, 0.0, 0.0]] + [[-2.0, 0.0, 0.0]] * 777, [[99.0, 0.0, 0.0]] + [[99.0, 0.0, 0.0]] * 777]]),
         }
         targets = {
-            "hand_valid": torch.tensor([True]),
+            "hand_valid": torch.tensor([[True, False]]),
             "scene_scale": torch.tensor([3.0]),
-            "hand_is_right": torch.tensor([False]),
-            "hand_transl": torch.tensor([[0.0, 0.0, 0.0]]),
-            "hand_pose_mano": torch.zeros(1, 48),
-            "hand_joints_3d_cam": torch.tensor([[[-1.0, 0.0, 0.0]] + [[-2.0, 0.0, 0.0]] * 20]),
-            "hand_mano_betas": torch.zeros(1, 10),
+            "hand_is_right": torch.tensor([[False, True]]),
+            "hand_global_orient_rotmat": torch.eye(3).view(1, 1, 1, 3, 3).repeat(1, 2, 1, 1, 1),
+            "hand_transl": torch.tensor([[[0.0, 0.0, 0.0], [123.0, 0.0, 0.0]]]),
+            "hand_pose_rotmat": torch.eye(3).view(1, 1, 1, 3, 3).repeat(1, 2, 15, 1, 1),
+            "hand_joints_3d": torch.tensor([[[[-1.0, 0.0, 0.0]] + [[-2.0, 0.0, 0.0]] * 20, [[123.0, 0.0, 0.0]] + [[123.0, 0.0, 0.0]] * 20]]),
+            "hand_mano_betas": torch.zeros(1, 2, 10),
         }
 
         total, details = loss(pred, targets)
@@ -219,7 +218,8 @@ class HandObjectLossTests(unittest.TestCase):
             "pred_object_rot6d": torch.tensor([[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]]),
             "pred_object_transl_dir": torch.tensor([[0.0, 0.0, 1.0]]),
             "pred_object_transl_scale": torch.tensor([[4.0]]),
-            "pred_object_scale": torch.tensor([[8.0]]),
+            "pred_object_trans": torch.tensor([[0.0, 0.0, 1.0]]),
+            "pred_object_scale": torch.tensor([[2.0]]),
         }
         targets = {
             "object_valid": torch.tensor([True]),
@@ -234,10 +234,7 @@ class HandObjectLossTests(unittest.TestCase):
         total, details = loss(pred, targets)
 
         self.assertTrue(torch.isfinite(total))
-        self.assertTrue(torch.allclose(details["object_transl_scale_gt"], torch.tensor([[4.0]])))
-        self.assertTrue(torch.allclose(details["object_scale_gt"], torch.tensor([[8.0]])))
         self.assertLess(float(details["object_rot_loss"]), 1e-2)
-        self.assertAlmostEqual(float(details["object_transl_scale_loss"]), 0.0, places=6)
         self.assertAlmostEqual(float(details["object_scale_loss"]), 0.0, places=6)
 
 

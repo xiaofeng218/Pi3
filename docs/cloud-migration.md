@@ -11,7 +11,7 @@
 | 内容 | 远程仓库 |
 |------|---------|
 | Pi3 项目代码 | `https://github.com/xiaofeng218/Pi3.git`，分支 `training` |
-| ForeHOI 预处理代码 | 新建仓库（见第 6 节） |
+| ForeHOI 预处理代码 | `https://github.com/xiaofeng218/forehoi-pi3x-preproc.git`，分支 `main` |
 
 ### 1.2 模型权重 → Cloudflare R2
 
@@ -74,13 +74,16 @@ curl https://rclone.org/install.sh | sudo bash
 ```
 
 配置 R2 remote（执行一次，填入你的 Cloudflare R2 凭证）：
+<CF_API_TOKEN>
+* access key id： 
+* secret access key： 
 
 ```bash
 rclone config create r2 s3 \
   provider Cloudflare \
   access_key_id <R2_ACCESS_KEY_ID> \
   secret_access_key <R2_SECRET_ACCESS_KEY> \
-  endpoint https://<CLOUDFLARE_ACCOUNT_ID>.r2.cloudflarestorage.com \
+  endpoint https://acf03b261662da5c7bf3aef242e990c5.r2.cloudflarestorage.com \
   acl private
 ```
 
@@ -523,36 +526,14 @@ ForeHOI 目录下的预处理代码（`pi3x-preproc/`、`preprocess/`、`debug-p
 
 **不追踪（.gitignore）：** `outputs/`、`graspxl_renders/`、`front-3d/3D-FRONT*/`、`front-3d/3D-FUTURE*/`、`DART/`、`objaverse_assets/`、`blender-bin/`、`blender-runtime-5.1/`、`samples/`、`BlenderProc/`、`manopth/`、`template mesh/`
 
-### 6.2 本地初始化
+### 6.2 本地初始化（已完成）
 
-在当前服务器执行（已包含 `.git` 空目录，先清理再初始化）：
+仓库已初始化并完成首次提交（commit `80aa945`，50 个文件）。
+本地路径：`/mnt/2/data/dataset/ForeHOI`
 
-```bash
-cd /mnt/2/data/dataset/ForeHOI
+### 6.3 GitHub 远程仓库（已完成）
 
-# 清理空的 .git 目录（不是真正的 git repo）
-rm -rf .git
-
-# 初始化
-git init
-git add .gitignore README.md run.sh view_rerun_web.sh
-git add download_forehoi_minimal.py download_forehoi_minimal.sh download_objaverse_object.py example_loader.py
-git add pi3x-preproc/ preprocess/ debug-preproc/ docs/
-git add front-3d/download.sh front-3d/3D-FRONT-readme.md
-git commit -m "init: ForeHOI pi3x preprocessing pipeline"
-```
-
-### 6.3 创建 GitHub 远程仓库并推送
-
-在 GitHub 上创建新的私有仓库（建议名称：`forehoi-pi3x-preproc`），然后：
-
-```bash
-cd /mnt/2/data/dataset/ForeHOI
-
-git remote add origin https://github.com/xiaofeng218/forehoi-pi3x-preproc.git
-git branch -M main
-git push -u origin main
-```
+仓库已创建并推送：`https://github.com/xiaofeng218/forehoi-pi3x-preproc.git`（`main` 分支）
 
 ### 6.4 新服务器克隆
 

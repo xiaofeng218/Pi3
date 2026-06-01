@@ -74,9 +74,9 @@ curl https://rclone.org/install.sh | sudo bash
 ```
 
 配置 R2 remote（执行一次，填入你的 Cloudflare R2 凭证）：
-<CF_API_TOKEN>
-* access key id： 
-* secret access key： 
+* API Token（rclone 配置时粘贴）：<CF_API_TOKEN>
+* access key id：<R2_ACCESS_KEY_ID>
+* secret access key：<R2_SECRET_ACCESS_KEY>
 
 ```bash
 rclone config create r2 s3 \

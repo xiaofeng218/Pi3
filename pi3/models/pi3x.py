@@ -629,6 +629,7 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
                 intrinsics=obj_intrinsics,
                 poses=obj_poses,
                 rays=obj_rays,
+                normalize_poses_to_view0=False,  # keep absolute object-frame poses
             )
             obj_hidden = obj_hidden.reshape(obj_B, obj_N, -1, self.dec_embed_dim)
             obj_use_pose_mask = torch.ones((obj_B, obj_N), dtype=torch.bool, device=obj_imgs.device)
@@ -728,8 +729,8 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         return outputs
     
     def encode(
-        self, 
-        imgs, 
+        self,
+        imgs,
         with_prior=True,
         depths=None,
         rays=None,
@@ -738,6 +739,7 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
         mask_add_depth=None,
         mask_add_ray=None,
         mask_add_pose=None,
+        normalize_poses_to_view0=True,
     ):
         B, N, _, H, W = imgs.shape
         device = imgs.device
@@ -796,7 +798,10 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
                 depths_masks = (normalized_depths > 0).float()
                 depths_masks = depths_masks.reshape(B*N, 1, H, W)
 
-                poses_ = torch.einsum('bij, bnjk -> bnik', se3_inverse(poses[:, 0]), poses)
+                if normalize_poses_to_view0:
+                    poses_ = torch.einsum('bij, bnjk -> bnik', se3_inverse(poses[:, 0]), poses)
+                else:
+                    poses_ = poses.clone()
                 poses_[..., :3, 3] /= dep_median.view(B, 1, 1)
 
                 # noramlize for the batch not using depth

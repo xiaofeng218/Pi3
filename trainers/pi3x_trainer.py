@@ -351,14 +351,9 @@ class Pi3XTrainer(BaseTrainer):
             if omv_data is not None:
                 gt["omv_depth"] = omv_data["depthmap"]
                 gt["omv_intrinsics"] = omv_data["camera_intrinsics"]
-                # Normalize camera poses to view-0-relative:
-                # the encoder makes pose_0 identity; GT must match.
-                omv_pose_abs = omv_data["camera_pose"]
-                gt["omv_camera_pose"] = torch.einsum(
-                    "bij,bnjk->bnik",
-                    torch.inverse(omv_pose_abs[:, 0:1, :, :]),
-                    omv_pose_abs,
-                )
+                # Use absolute object-frame poses so GT matches the encoder input,
+                # which also receives absolute poses (normalize_poses_to_view0=False).
+                gt["omv_camera_pose"] = omv_data["camera_pose"]
 
         return [pred, gt]
 
